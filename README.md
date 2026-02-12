@@ -7,6 +7,7 @@ A real-time Electron-based desktop GUI for [DeepSeek-OCR](https://github.com/dee
 ## Features
 
 - Drag-and-drop image upload
+- Drag-and-drop image/PDF upload
 - Real-time OCR processing
 - **NEW: Queue processing** - Process multiple files or entire folders automatically
 - **NEW: CUDA optimizations** - Up to 6x faster with GPU acceleration
@@ -58,6 +59,31 @@ The installer is generated in `dist/` as an `.exe` file.
 On first app launch, the packaged build creates a Python environment in app data
 and installs dependencies automatically.
 
+## Testing (Cross-Platform E2E)
+
+The repository includes an end-to-end suite that runs against a deterministic mock backend (no model download required), plus host build/dist smoke checks.
+
+Install deps:
+
+- `npm ci`
+
+Run Electron E2E operations:
+
+- `npm run test:e2e`
+
+Run host build smoke (`electron-builder --dir`):
+
+- `npm run test:build:smoke`
+
+Run host distribution packaging:
+
+- `npm run test:dist:host`
+
+CI workflows:
+
+- `.github/workflows/ci-e2e.yml` runs E2E + build smoke on Linux/macOS/Windows.
+- `.github/workflows/dist-matrix.yml` runs full host dist packaging on Linux/macOS/Windows (manual dispatch).
+
 ## Quick Start (Windows)
 
 1. **Install Python 3.10-3.12** if not already installed ([Python 3.10 recommended](https://www.python.org/ftp/python/3.10.14/python-3.10.14-amd64.exe))
@@ -93,11 +119,9 @@ For packaged builds, run `bash ./scripts/build-release.sh` on Linux/macOS to gen
 - [ ] Code cleanup needed (quickly put together)
 - [ ] TypeScript
 - [ ] Updater from GitHub releases
-- [ ] PDF support
 - [ ] Batch processing
 - [ ] CPU support?
 - [ ] Web version (so you can run the server on a different machine)
-- [ ] Better progress bar algo
 - [ ] ???
 
 ## License

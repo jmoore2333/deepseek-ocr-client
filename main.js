@@ -71,6 +71,7 @@ function getAppPaths() {
   return {
     runtimeRoot,
     backendScript: path.join(runtimeRoot, 'backend', 'ocr_server.py'),
+    mockBackendScript: path.join(runtimeRoot, 'tests', 'e2e', 'mock_backend.js'),
     uvBinary: path.join(runtimeRoot, 'runtime', process.platform === 'win32' ? 'uv.exe' : 'uv'),
     requirementsFile: path.join(runtimeRoot, 'requirements.txt'),
     pythonEnvRoot,
@@ -479,51 +480,74 @@ async function startPythonServer() {
   console.log('Starting Python OCR server...');
   setStartupStatus('backend-init', 'Preparing backend startup...', 5);
   const paths = getAppPaths();
+  const useMockBackend = process.env.DEEPSEEK_MOCK_BACKEND === '1';
 
-  // Check if backend script exists
-  if (!fs.existsSync(paths.backendScript)) {
-    throw new Error(`Python script not found: ${paths.backendScript}`);
-  }
+  let backendCommand;
+  let backendArgs = [];
+  let backendEnv;
+  let backendLogLabel;
 
-  let pythonExecutable;
-
-  // Packaged builds bootstrap a managed venv with bundled uv.
-  if (app.isPackaged) {
-    pythonExecutable = await setupPythonEnvironmentWithUv(paths);
-  } else {
-    setStartupStatus('dev-env', 'Using development Python environment', 20);
-    // Development mode: prefer local venv and fall back to system Python.
-    if (process.platform === 'win32') {
-      const venvPython = path.join(__dirname, 'venv', 'Scripts', 'python.exe');
-      pythonExecutable = fs.existsSync(venvPython) ? venvPython : 'python';
-    } else {
-      const venvPython = path.join(__dirname, 'venv', 'bin', 'python3');
-      pythonExecutable = fs.existsSync(venvPython) ? venvPython : 'python3';
+  if (useMockBackend) {
+    if (!fs.existsSync(paths.mockBackendScript)) {
+      throw new Error(`Mock backend script not found: ${paths.mockBackendScript}`);
     }
+    backendCommand = process.execPath;
+    backendArgs = [paths.mockBackendScript];
+    backendEnv = {
+      ...process.env,
+      MOCK_BACKEND_PORT: String(PYTHON_SERVER_PORT)
+    };
+    backendLogLabel = 'MockBackend';
+    setStartupStatus('backend-launch', 'Launching mock backend service...', 96);
+  } else {
+    // Check if backend script exists
+    if (!fs.existsSync(paths.backendScript)) {
+      throw new Error(`Python script not found: ${paths.backendScript}`);
+    }
+
+    let pythonExecutable;
+
+    // Packaged builds bootstrap a managed venv with bundled uv.
+    if (app.isPackaged) {
+      pythonExecutable = await setupPythonEnvironmentWithUv(paths);
+    } else {
+      setStartupStatus('dev-env', 'Using development Python environment', 20);
+      // Development mode: prefer local venv and fall back to system Python.
+      if (process.platform === 'win32') {
+        const venvPython = path.join(__dirname, 'venv', 'Scripts', 'python.exe');
+        pythonExecutable = fs.existsSync(venvPython) ? venvPython : 'python';
+      } else {
+        const venvPython = path.join(__dirname, 'venv', 'bin', 'python3');
+        pythonExecutable = fs.existsSync(venvPython) ? venvPython : 'python3';
+      }
+    }
+
+    console.log(`Using Python: ${pythonExecutable}`);
+    setStartupStatus('backend-launch', 'Launching OCR backend service...', 96);
+
+    ensureDirectory(paths.pythonEnvRoot);
+    ensureDirectory(paths.cacheRoot);
+    ensureDirectory(paths.huggingFaceRoot);
+    ensureDirectory(path.join(paths.huggingFaceRoot, 'hub'));
+
+    backendCommand = pythonExecutable;
+    backendArgs = [paths.backendScript];
+    backendEnv = {
+      ...process.env,
+      PYTHONUNBUFFERED: '1',
+      DEEPSEEK_OCR_CACHE_DIR: paths.cacheRoot,
+      HF_HOME: paths.huggingFaceRoot,
+      HF_HUB_CACHE: path.join(paths.huggingFaceRoot, 'hub'),
+      TRANSFORMERS_CACHE: path.join(paths.huggingFaceRoot, 'hub'),
+      PIP_CACHE_DIR: path.join(paths.pythonEnvRoot, 'pip-cache')
+    };
+    backendLogLabel = 'Python';
   }
-
-  console.log(`Using Python: ${pythonExecutable}`);
-  setStartupStatus('backend-launch', 'Launching OCR backend service...', 96);
-
-  ensureDirectory(paths.pythonEnvRoot);
-  ensureDirectory(paths.cacheRoot);
-  ensureDirectory(paths.huggingFaceRoot);
-  ensureDirectory(path.join(paths.huggingFaceRoot, 'hub'));
-
-  const pythonEnv = {
-    ...process.env,
-    PYTHONUNBUFFERED: '1',
-    DEEPSEEK_OCR_CACHE_DIR: paths.cacheRoot,
-    HF_HOME: paths.huggingFaceRoot,
-    HF_HUB_CACHE: path.join(paths.huggingFaceRoot, 'hub'),
-    TRANSFORMERS_CACHE: path.join(paths.huggingFaceRoot, 'hub'),
-    PIP_CACHE_DIR: path.join(paths.pythonEnvRoot, 'pip-cache')
-  };
 
   return new Promise((resolve, reject) => {
-    pythonProcess = spawn(pythonExecutable, [paths.backendScript], {
+    pythonProcess = spawn(backendCommand, backendArgs, {
       windowsHide: true,
-      env: pythonEnv
+      env: backendEnv
     });
 
     let resolved = false;
@@ -538,7 +562,7 @@ async function startPythonServer() {
     };
 
     pythonProcess.stdout.on('data', (data) => {
-      console.log(`Python: ${data.toString()}`);
+      console.log(`${backendLogLabel}: ${data.toString()}`);
 
       // Check if server is ready
       if (data.toString().includes('Running on')) {
@@ -548,7 +572,7 @@ async function startPythonServer() {
 
     pythonProcess.stderr.on('data', (data) => {
       // Flask logs to stderr by default, even for INFO messages
-      console.log(`Python: ${data.toString()}`);
+      console.log(`${backendLogLabel}: ${data.toString()}`);
 
       // Flask logs to stderr, so also check here for server ready message
       if (data.toString().includes('Running on')) {

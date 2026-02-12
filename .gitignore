@@ -39,6 +39,8 @@ Desktop.ini
 # Logs
 *.log
 logs/
+playwright-report/
+test-results/
 
 # Electron
 out/
