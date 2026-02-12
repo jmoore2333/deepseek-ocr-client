@@ -7,6 +7,7 @@ import os
 import sys
 import logging
 import re
+import math
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 import torch
@@ -460,6 +461,13 @@ def extract_raw_token_section(accumulated_text):
         return None
     return parts[2].strip().lstrip('=').strip()
 
+
+def estimate_stream_progress(chars_generated):
+    """Estimate stream progress with a smooth curve that avoids long stalls."""
+    if chars_generated <= 0:
+        return 8
+    return min(92, 8 + int(84 * (1 - math.exp(-chars_generated / 900.0))))
+
 @app.route('/health', methods=['GET'])
 def health_check():
     """Health check endpoint"""
@@ -600,7 +608,14 @@ def perform_ocr():
                 raw_token_text = extract_raw_token_section(self.accumulated_text)
                 if raw_token_text:
                     char_count[0] = len(raw_token_text)
-                    update_progress('processing', 'ocr', 'Generating OCR...', 50, char_count[0], raw_token_text)
+                    update_progress(
+                        'processing',
+                        'ocr',
+                        'Generating OCR...',
+                        estimate_stream_progress(char_count[0]),
+                        char_count[0],
+                        raw_token_text
+                    )
 
             def flush(self):
                 self.original.flush()
@@ -808,6 +823,7 @@ def process_queue():
         
         with queue_lock:
             items_to_process = [item for item in processing_queue if item['status'] == 'pending']
+        total_items = max(len(items_to_process), 1)
         
         for idx, item in enumerate(items_to_process):
             try:
@@ -896,16 +912,18 @@ def process_queue():
                                 if raw_token_text:
                                     char_count[0] = len(raw_token_text)
                                     progress_msg = f"[{idx + 1}/{len(items_to_process)}] {item['filename']}"
+                                    item_progress = estimate_stream_progress(char_count[0])
+                                    overall_progress = int(((idx + (item_progress / 100.0)) / total_items) * 100)
                                     update_progress(
                                         'processing',
                                         'queue',
                                         f"{progress_msg} (page 1/1)",
-                                        int((idx / len(items_to_process)) * 100),
+                                        overall_progress,
                                         char_count[0],
                                         raw_token_text
                                     )
                                     with queue_lock:
-                                        item['progress'] = min(int((char_count[0] / 1000) * 100), 90)
+                                        item['progress'] = item_progress
                                         item['progress_detail'] = 'Page 1/1'
 
                             def flush(self):

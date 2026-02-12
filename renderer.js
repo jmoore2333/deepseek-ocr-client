@@ -111,6 +111,49 @@ function isPdfPath(filePath) {
     return path.extname(filePath || '').toLowerCase() === '.pdf';
 }
 
+function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function clampPercent(value) {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric)) {
+        return 0;
+    }
+    return Math.max(0, Math.min(100, Math.round(numeric)));
+}
+
+async function waitForModelLoadCompletion(timeoutMs = 180000, pollMs = 500) {
+    const startedAt = Date.now();
+    let lastPercent = 0;
+
+    while (Date.now() - startedAt < timeoutMs) {
+        try {
+            const response = await fetch('http://127.0.0.1:5000/progress');
+            const data = await response.json();
+
+            if (data.status === 'loading') {
+                lastPercent = Math.max(lastPercent, clampPercent(data.progress_percent));
+                const stageText = data.message || data.stage || 'Preparing model...';
+                progressStatus.textContent = `Loading ${lastPercent}% - ${stageText}`;
+            } else if (data.status === 'loaded') {
+                progressStatus.textContent = 'Model loaded successfully!';
+                return data;
+            } else if (data.status === 'error') {
+                const message = data.message ? `Error loading model: ${data.message}` : 'Error loading model';
+                progressStatus.textContent = message;
+                return data;
+            }
+        } catch (error) {
+            // Transient polling failures are expected while backend state changes.
+        }
+
+        await sleep(pollMs);
+    }
+
+    return { status: 'timeout', message: 'Timed out waiting for model loading progress' };
+}
+
 window.addEventListener('DOMContentLoaded', () => {
     marked.setOptions({
         mangle: false,
@@ -740,8 +783,6 @@ function renderBoxes(boxes, imageWidth, imageHeight, promptType) {
 async function loadModel() {
     if (isProcessing) return;
 
-    let pollInterval = null;
-
     try {
         isProcessing = true;
         loadModelBtn.disabled = true;
@@ -751,86 +792,36 @@ async function loadModel() {
         progressInline.style.display = 'flex';
         progressStatus.textContent = 'Loading model...';
 
-        // Start polling for progress updates
-        const pollProgress = async () => {
-            try {
-                const response = await fetch('http://127.0.0.1:5000/progress');
-                const data = await response.json();
-                console.log('Progress update:', data);
-
-                if (data.status === 'loading') {
-                    const percent = data.progress_percent || 0;
-                    progressStatus.textContent = `Loading ${percent}% - ${data.stage || ''}`;
-                } else if (data.status === 'loaded') {
-                    progressStatus.textContent = 'Model loaded successfully!';
-
-                    // Stop polling when done
-                    if (pollInterval) {
-                        clearInterval(pollInterval);
-                        pollInterval = null;
-                    }
-                } else if (data.status === 'error') {
-                    progressStatus.textContent = 'Error loading model';
-
-                    // Stop polling on error
-                    if (pollInterval) {
-                        clearInterval(pollInterval);
-                        pollInterval = null;
-                    }
-                }
-            } catch (error) {
-                console.error('Error polling progress:', error);
-            }
-        };
-
-        // Poll every 500ms
-        pollInterval = setInterval(pollProgress, 500);
-
         // Trigger model loading
         const result = await ipcRenderer.invoke('load-model');
+        if (!result.success) {
+            progressInline.style.display = 'none';
+            showMessage(`Failed to load model: ${result.error}`, 'error');
+            await checkServerStatus();
+            return;
+        }
 
-        // Wait for final status
-        await new Promise(resolve => {
-            const checkStatus = setInterval(async () => {
-                try {
-                    const response = await fetch('http://127.0.0.1:5000/progress');
-                    const data = await response.json();
-
-                    if (data.status === 'loaded' || data.status === 'error') {
-                        clearInterval(checkStatus);
-                        if (pollInterval) {
-                            clearInterval(pollInterval);
-                            pollInterval = null;
-                        }
-                        resolve();
-                    }
-                } catch (error) {
-                    console.error('Error checking status:', error);
-                }
-            }, 500);
-        });
+        // Wait for completion with a single polling loop (reduces duplicate requests).
+        const finalProgress = await waitForModelLoadCompletion();
 
         // Hide progress indicator
         progressInline.style.display = 'none';
 
-        if (result.success) {
+        if (finalProgress.status === 'loaded') {
             showMessage('Model loaded successfully!', 'success');
-            await checkServerStatus();
+        } else if (finalProgress.status === 'error') {
+            showMessage(`Model loading failed: ${finalProgress.message || 'Unknown error'}`, 'error');
+        } else if (finalProgress.status === 'timeout') {
+            showMessage('Model loading is taking longer than expected. Check logs and try again.', 'warning');
         } else {
-            showMessage(`Failed to load model: ${result.error}`, 'error');
-            await checkServerStatus(); // Update button state even on failure
+            showMessage('Model loading state is unknown. Please check server status.', 'warning');
         }
+        await checkServerStatus();
     } catch (error) {
-        if (pollInterval) {
-            clearInterval(pollInterval);
-        }
         progressInline.style.display = 'none';
         showMessage(`Error: ${error.message}`, 'error');
         await checkServerStatus(); // Update button state even on error
     } finally {
-        if (pollInterval) {
-            clearInterval(pollInterval);
-        }
         isProcessing = false;
         // Don't reset button state here - let checkServerStatus() handle it
     }
@@ -1231,10 +1222,16 @@ async function updateQueueDisplay() {
             // Update progress
             const totalFiles = queueData.total;
             const completedFiles = queueData.completed + queueData.failed;
-            queueProgressText.textContent = `${completedFiles}/${totalFiles}`;
+            const processingProgress = queueItems
+                .filter((item) => item.status === 'processing')
+                .reduce((sum, item) => sum + (clampPercent(item.progress) / 100), 0);
+            const weightedCompleted = completedFiles + processingProgress;
+            const activeItem = queueItems.find((item) => item.status === 'processing');
+            const activeText = activeItem ? ` (active ${clampPercent(activeItem.progress)}%)` : '';
+            queueProgressText.textContent = `${completedFiles}/${totalFiles}${activeText}`;
             
             if (totalFiles > 0) {
-                const progressPercent = (completedFiles / totalFiles) * 100;
+                const progressPercent = (weightedCompleted / totalFiles) * 100;
                 queueProgressBar.style.width = `${progressPercent}%`;
             } else {
                 queueProgressBar.style.width = '0%';

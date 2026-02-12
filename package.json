@@ -37,7 +37,8 @@
       "main.js",
       "renderer.js",
       "styles.css",
-      "package.json"
+      "package.json",
+      "assets/**/*"
     ],
     "extraResources": [
       {
@@ -64,17 +65,20 @@
       }
     ],
     "win": {
+      "icon": "assets/icons/icon.ico",
       "target": [
         "nsis"
       ]
     },
     "mac": {
+      "icon": "assets/icons/icon.icns",
       "target": [
         "dmg"
       ],
       "category": "public.app-category.productivity"
     },
     "linux": {
+      "icon": "assets/icons/icon.png",
       "target": [
         "AppImage",
         "deb"
