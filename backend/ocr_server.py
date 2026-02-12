@@ -12,7 +12,10 @@ import torch
 from transformers import AutoModel, AutoTokenizer
 import tempfile
 import time
+import json
+from datetime import datetime
 from threading import Thread, Lock
+from pathlib import Path
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -27,11 +30,45 @@ CORS(app)
 # Global variables for model and tokenizer
 model = None
 tokenizer = None
-MODEL_NAME = 'deepseek-ai/DeepSeek-OCR'
+device = 'cpu'
+dtype = torch.float32
 
-# Use local cache directory relative to the app
+
+def get_preferred_device():
+    """Select runtime device based on availability or override."""
+    if 'DEVICE' in os.environ:
+        return os.environ['DEVICE'].lower()
+    if torch.cuda.is_available():
+        return 'cuda'
+    if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+        return 'mps'
+    return 'cpu'
+
+
+def get_preferred_model_name():
+    """Use upstream model for CUDA, MPS/CPU-compatible fork otherwise."""
+    if 'MODEL_NAME' in os.environ:
+        return os.environ['MODEL_NAME']
+    if get_preferred_device() == 'cuda':
+        return 'deepseek-ai/DeepSeek-OCR'
+    return 'Dogacel/DeepSeek-OCR-Metal-MPS'
+
+
+MODEL_NAME = get_preferred_model_name()
+
+# Queue processing state
+processing_queue = []
+queue_lock = Lock()
+current_queue_id = None
+queue_results = {}
+
+# Use a writable cache directory (override via env for packaged apps)
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-CACHE_DIR = os.path.join(SCRIPT_DIR, '..', 'cache')
+CACHE_DIR = os.environ.get('DEEPSEEK_OCR_CACHE_DIR')
+if CACHE_DIR:
+    CACHE_DIR = os.path.abspath(CACHE_DIR)
+else:
+    CACHE_DIR = os.path.join(SCRIPT_DIR, '..', 'cache')
 MODEL_CACHE_DIR = os.path.join(CACHE_DIR, 'models')
 OUTPUT_DIR = os.path.join(CACHE_DIR, 'outputs')
 
@@ -64,14 +101,13 @@ def update_progress(status, stage='', message='', progress_percent=0, chars_gene
         else:
             logger.info(f"Progress: {status} - {stage} - {message} ({progress_percent}%)")
 
-def check_gpu_availability():
-    """Check if CUDA is available"""
-    if torch.cuda.is_available():
-        logger.info(f"GPU available: {torch.cuda.get_device_name(0)}")
-        return True
+def log_selected_device(selected_device):
+    if selected_device == 'cuda':
+        logger.info(f"Using CUDA: {torch.cuda.get_device_name(0)}")
+    elif selected_device == 'mps':
+        logger.info("Using Apple Silicon GPU (MPS)")
     else:
-        logger.warning("No GPU available, will use CPU (this will be slow!)")
-        return False
+        logger.warning("Using CPU backend (this will be slower)")
 
 def get_cache_dir_size(directory):
     """Get total size of files in directory in bytes"""
@@ -86,9 +122,21 @@ def get_cache_dir_size(directory):
         pass
     return total
 
+
+def run_model_infer(**kwargs):
+    """Run model inference with device arguments when supported by the model."""
+    global model, tokenizer, device, dtype
+    if device == 'cuda':
+        return model.infer(tokenizer, **kwargs)
+    try:
+        return model.infer(tokenizer, device=torch.device(device), dtype=dtype, **kwargs)
+    except TypeError:
+        logger.warning("Model infer() does not accept explicit device/dtype, retrying default call")
+        return model.infer(tokenizer, **kwargs)
+
 def load_model_background():
     """Background thread function to load the model"""
-    global model, tokenizer
+    global model, tokenizer, device, dtype
 
     try:
         update_progress('loading', 'init', 'Initializing model loading...', 0)
@@ -98,8 +146,9 @@ def load_model_background():
         # Create cache directory if it doesn't exist
         os.makedirs(MODEL_CACHE_DIR, exist_ok=True)
 
-        # Check GPU availability
-        has_gpu = check_gpu_availability()
+        # Select and report runtime device
+        device = get_preferred_device()
+        log_selected_device(device)
 
         # Load tokenizer (10% progress)
         update_progress('loading', 'tokenizer', 'Loading tokenizer...', 10)
@@ -183,14 +232,64 @@ def load_model_background():
         update_progress('loading', 'gpu', 'Moving model to GPU...', 80)
         model = model.eval()
 
-        # Move to GPU if available (90% progress)
-        update_progress('loading', 'gpu', 'Optimizing model on GPU...', 90)
-        if has_gpu:
-            model = model.cuda().to(torch.bfloat16)
-            logger.info("Model loaded on GPU with bfloat16")
+        # Move model to selected device (85% progress)
+        update_progress('loading', 'gpu', 'Optimizing model on GPU...', 85)
+        if device == 'cuda':
+            compute_cap = torch.cuda.get_device_capability()
+            if compute_cap[0] >= 8:  # Ampere or newer (RTX 30/40/50 series)
+                dtype = torch.bfloat16
+            else:  # Pascal/Turing (GTX 10/16 series, RTX 20 series)
+                dtype = torch.float16
+            model = model.cuda().to(dtype)
+            logger.info(f"Model loaded on CUDA with dtype={dtype} (Compute {compute_cap[0]}.{compute_cap[1]})")
+        elif device == 'mps':
+            dtype = torch.float16
+            model = model.to(torch.device('mps')).to(dtype)
+            logger.info("Model loaded on MPS with float16")
         else:
-            # CPU mode - use float32
-            logger.info("Model loaded on CPU (inference will be slower)")
+            dtype = torch.float32
+            model = model.to(torch.device('cpu')).to(dtype)
+            logger.info("Model loaded on CPU with float32")
+
+        # Apply torch.compile for ~30% inference speedup (PyTorch 2.0+) (95% progress)
+        update_progress('loading', 'optimize', 'Compiling model with torch.compile...', 95)
+        try:
+            if hasattr(torch, 'compile') and device == 'cuda':
+                logger.info("Applying torch.compile for faster inference...")
+                model = torch.compile(model, mode="reduce-overhead")
+                logger.info("Model compiled successfully (expect ~30% speedup)")
+            else:
+                logger.info("torch.compile unavailable or unsupported for current device, skipping compilation")
+        except Exception as e:
+            logger.warning(f"torch.compile failed: {e}, using uncompiled model")
+
+        # Warmup inference to initialize graphs
+        if device in ('cuda', 'mps'):
+            update_progress('loading', 'warmup', 'Running warmup inference...', 98)
+            logger.info("Running warmup inference...")
+            try:
+                # Create a small dummy image for warmup
+                import numpy as np
+                from PIL import Image
+                dummy_img = Image.fromarray(np.random.randint(0, 255, (100, 100, 3), dtype=np.uint8))
+                with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp:
+                    dummy_img.save(tmp.name)
+                with tempfile.TemporaryDirectory() as warmup_output:
+                    run_model_infer(
+                        prompt='<image>\nFree OCR. ',
+                        image_file=tmp.name,
+                        output_path=warmup_output,
+                        base_size=512,
+                        image_size=512,
+                        crop_mode=False,
+                        save_results=False,
+                        test_compress=False
+                    )
+                    logger.info("Warmup inference complete")
+                if os.path.exists(tmp.name):
+                    os.unlink(tmp.name)
+            except Exception as e:
+                logger.warning(f"Warmup inference failed: {e}")
 
         logger.info("Model loaded successfully!")
         update_progress('loaded', 'complete', 'Model ready!', 100)
@@ -230,13 +329,44 @@ def load_model():
 
     return True
 
+def clear_cuda_cache():
+    """Clear CUDA cache to free memory between processing"""
+    if device == 'cuda' and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+
+def create_queue_output_folder():
+    """Create a timestamped folder for queue processing results"""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    queue_folder = os.path.join(OUTPUT_DIR, f"queue_{timestamp}")
+    os.makedirs(queue_folder, exist_ok=True)
+    return queue_folder
+
+def get_prompt_for_type(prompt_type):
+    """Get prompt text for given type"""
+    prompts = {
+        'document': '<image>\n<|grounding|>Convert the document to markdown. ',
+        'ocr': '<image>\n<|grounding|>OCR this image. ',
+        'free': '<image>\nFree OCR. ',
+        'figure': '<image>\nParse the figure. ',
+        'describe': '<image>\nDescribe this image in detail. '
+    }
+    return prompts.get(prompt_type, prompts['document'])
+
+def get_result_filename(prompt_type):
+    """Get expected result filename for prompt type"""
+    if prompt_type == 'document':
+        return 'result.mmd'
+    return 'result.txt'
+
 @app.route('/health', methods=['GET'])
 def health_check():
     """Health check endpoint"""
     return jsonify({
         'status': 'ok',
         'model_loaded': model is not None,
-        'gpu_available': torch.cuda.is_available()
+        'gpu_available': device in ('cuda', 'mps'),
+        'device_state': device
     })
 
 @app.route('/progress', methods=['GET'])
@@ -258,7 +388,7 @@ def load_model_endpoint():
 @app.route('/ocr', methods=['POST'])
 def perform_ocr():
     """Perform OCR on uploaded image"""
-    global model, tokenizer
+    global model, tokenizer, device, dtype
 
     try:
         # Check if model is loaded
@@ -343,7 +473,7 @@ def perform_ocr():
                     try:
                         safe_text = text.encode(self.original.encoding or 'utf-8', errors='replace').decode(self.original.encoding or 'utf-8')
                         self.original.write(safe_text)
-                    except:
+                    except Exception:
                         # If all else fails, just skip writing to original stdout
                         pass
 
@@ -382,8 +512,7 @@ def perform_ocr():
         sys.stdout = char_stream
 
         try:
-            model.infer(
-                tokenizer,
+            run_model_infer(
                 prompt=prompt,
                 image_file=temp_image_path,
                 output_path=OUTPUT_DIR,
@@ -467,9 +596,358 @@ def model_info():
         'model_name': MODEL_NAME,
         'cache_dir': MODEL_CACHE_DIR,
         'model_loaded': model is not None,
-        'gpu_available': torch.cuda.is_available(),
-        'gpu_name': torch.cuda.get_device_name(0) if torch.cuda.is_available() else None
+        'gpu_available': device in ('cuda', 'mps'),
+        'device_state': device,
+        'gpu_name': torch.cuda.get_device_name(0) if (device == 'cuda' and torch.cuda.is_available()) else None
     })
+
+@app.route('/queue/add', methods=['POST'])
+def add_to_queue():
+    """Add files to the processing queue"""
+    global processing_queue
+    
+    try:
+        # Get files from request
+        files = request.files.getlist('files')
+        if not files:
+            return jsonify({'status': 'error', 'message': 'No files provided'}), 400
+        
+        # Get processing parameters
+        prompt_type = request.form.get('prompt_type', 'document')
+        base_size = int(request.form.get('base_size', 1024))
+        image_size = int(request.form.get('image_size', 640))
+        crop_mode = request.form.get('crop_mode', 'true').lower() == 'true'
+        
+        added_files = []
+        with queue_lock:
+            for file in files:
+                if file.filename:
+                    # Save file temporarily
+                    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.jpg')
+                    file.save(temp_file.name)
+                    temp_file.close()
+                    
+                    queue_item = {
+                        'id': len(processing_queue),
+                        'filename': file.filename,
+                        'temp_path': temp_file.name,
+                        'prompt_type': prompt_type,
+                        'base_size': base_size,
+                        'image_size': image_size,
+                        'crop_mode': crop_mode,
+                        'status': 'pending',
+                        'progress': 0,
+                        'result': None,
+                        'error': None
+                    }
+                    processing_queue.append(queue_item)
+                    added_files.append({'id': queue_item['id'], 'filename': file.filename})
+        
+        return jsonify({
+            'status': 'success',
+            'added': len(added_files),
+            'files': added_files,
+            'queue_length': len(processing_queue)
+        })
+    
+    except Exception as e:
+        logger.error(f"Error adding to queue: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/queue/status', methods=['GET'])
+def get_queue_status():
+    """Get current queue status with current file info for preview"""
+    with queue_lock:
+        # Find currently processing item
+        current_item = next((item for item in processing_queue if item['status'] == 'processing'), None)
+        
+        queue_summary = {
+            'total': len(processing_queue),
+            'pending': sum(1 for item in processing_queue if item['status'] == 'pending'),
+            'processing': sum(1 for item in processing_queue if item['status'] == 'processing'),
+            'completed': sum(1 for item in processing_queue if item['status'] == 'completed'),
+            'failed': sum(1 for item in processing_queue if item['status'] == 'failed'),
+            'items': [{
+                'id': item['id'],
+                'filename': item['filename'],
+                'status': item['status'],
+                'progress': item['progress'],
+                'error': item['error']
+            } for item in processing_queue],
+            'current_file': {
+                'id': current_item['id'],
+                'filename': current_item['filename'],
+                'image_path': current_item.get('current_image_path'),
+                'progress': current_item['progress']
+            } if current_item else None
+        }
+    
+    return jsonify(queue_summary)
+
+@app.route('/queue/process', methods=['POST'])
+def process_queue():
+    """Start processing the queue sequentially"""
+    global model, tokenizer, current_queue_id, device, dtype
+    
+    try:
+        # Check if model is loaded, load it if not
+        if model is None or tokenizer is None:
+            logger.info("Model not loaded, loading now before processing queue...")
+            load_model()
+            
+            # Wait for model to load (poll until loaded or error)
+            max_wait = 300  # 5 minutes max
+            start_time = time.time()
+            while (time.time() - start_time) < max_wait:
+                # Check progress status
+                with progress_lock:
+                    status = progress_data['status']
+                    
+                if status == 'loaded' and model is not None and tokenizer is not None:
+                    logger.info("Model loaded successfully, starting queue processing")
+                    break
+                elif status == 'error':
+                    error_msg = progress_data.get('message', 'Unknown error')
+                    logger.error(f"Model loading failed: {error_msg}")
+                    return jsonify({'status': 'error', 'message': f"Model loading failed: {error_msg}"}), 500
+                
+                time.sleep(2)  # Check every 2 seconds
+            
+            # Final check after timeout
+            if model is None or tokenizer is None:
+                logger.error("Model failed to load within timeout")
+                return jsonify({'status': 'error', 'message': 'Model failed to load within 5 minutes. Please try loading model manually first.'}), 500
+            
+            # Extra safety: wait 2 more seconds for model to be fully ready
+            logger.info("Waiting for model to be fully ready...")
+            time.sleep(2)
+        
+        # Create output folder for this queue
+        queue_folder = create_queue_output_folder()
+        logger.info(f"Processing queue - output folder: {queue_folder}")
+        
+        # Process queue sequentially
+        results_summary = []
+        
+        with queue_lock:
+            items_to_process = [item for item in processing_queue if item['status'] == 'pending']
+        
+        for idx, item in enumerate(items_to_process):
+            try:
+                with queue_lock:
+                    item['status'] = 'processing'
+                    current_queue_id = item['id']
+                
+                progress_msg = f"[{idx + 1}/{len(items_to_process)}] Processing {item['filename']}"
+                logger.info(f"=== {progress_msg} ===")
+                
+                # Create output subfolder for this file
+                file_output_dir = os.path.join(queue_folder, f"file_{item['id']:03d}_{Path(item['filename']).stem}")
+                os.makedirs(file_output_dir, exist_ok=True)
+                
+                # Update progress
+                update_progress('processing', 'queue', progress_msg, int((idx / len(items_to_process)) * 100), 0)
+                
+                # Perform OCR with progress tracking (similar to single file)
+                try:
+                    # Store current file path for frontend to display
+                    with queue_lock:
+                        item['current_image_path'] = item['temp_path']
+                    
+                    # Use character counting stream like in perform_ocr
+                    old_stdout = sys.stdout
+                    char_count = [0]
+                    
+                    class CharCountingStream:
+                        def __init__(self, original_stdout):
+                            self.original = original_stdout
+                            self.accumulated_text = ''
+                            self.section_count = 0
+                        
+                        def write(self, text):
+                            # Don't write to console (too verbose for queue)
+                            # But do accumulate for progress tracking
+                            self.accumulated_text += text
+                            self.section_count = self.accumulated_text.count('=' * 20)
+                            
+                            if self.section_count >= 2:
+                                parts = self.accumulated_text.split('=' * 20)
+                                if len(parts) >= 3:
+                                    raw_token_text = parts[2].strip().lstrip('=').strip()
+                                    char_count[0] = len(raw_token_text)
+                                    
+                                    # Update progress with raw token stream
+                                    if char_count[0] > 0:
+                                        progress_msg = f"[{idx + 1}/{len(items_to_process)}] {item['filename']}"
+                                        update_progress('processing', 'queue', progress_msg, 
+                                                      int((idx / len(items_to_process)) * 100), 
+                                                      char_count[0], raw_token_text)
+                                        
+                                        # Also update item progress
+                                        with queue_lock:
+                                            item['progress'] = min(int((char_count[0] / 1000) * 100), 90)
+                        
+                        def flush(self):
+                            pass
+                    
+                    char_stream = CharCountingStream(old_stdout)
+                    sys.stdout = char_stream
+                    
+                    try:
+                        run_model_infer(
+                            prompt=get_prompt_for_type(item['prompt_type']),
+                            image_file=item['temp_path'],
+                            output_path=file_output_dir,
+                            base_size=item['base_size'],
+                            image_size=item['image_size'],
+                            crop_mode=item['crop_mode'],
+                            save_results=True,
+                            test_compress=True
+                        )
+                    finally:
+                        sys.stdout = old_stdout  # Restore stdout
+                    
+                    # Read result
+                    result_file = get_result_filename(item['prompt_type'])
+                    result_path = os.path.join(file_output_dir, result_file)
+                    
+                    result_text = None
+                    if os.path.exists(result_path):
+                        with open(result_path, 'r', encoding='utf-8') as f:
+                            result_text = f.read()
+                    
+                    # Save metadata
+                    metadata = {
+                        'filename': item['filename'],
+                        'prompt_type': item['prompt_type'],
+                        'base_size': item['base_size'],
+                        'image_size': item['image_size'],
+                        'crop_mode': item['crop_mode'],
+                        'processed_at': datetime.now().isoformat(),
+                        'status': 'completed'
+                    }
+                    with open(os.path.join(file_output_dir, 'metadata.json'), 'w') as f:
+                        json.dump(metadata, f, indent=2)
+                    
+                    with queue_lock:
+                        item['status'] = 'completed'
+                        item['progress'] = 100
+                        item['result'] = result_text
+                    
+                    logger.info(f"✓ Completed: {item['filename']} -> {file_output_dir}")
+                    
+                    results_summary.append({
+                        'id': item['id'],
+                        'filename': item['filename'],
+                        'status': 'completed',
+                        'output_dir': file_output_dir
+                    })
+                    
+                except Exception as e:
+                    logger.error(f"Error processing {item['filename']}: {e}")
+                    with queue_lock:
+                        item['status'] = 'failed'
+                        item['error'] = str(e)
+                    
+                    results_summary.append({
+                        'id': item['id'],
+                        'filename': item['filename'],
+                        'status': 'failed',
+                        'error': str(e)
+                    })
+                
+                finally:
+                    # Clean up temp file
+                    if os.path.exists(item['temp_path']):
+                        os.remove(item['temp_path'])
+                    
+                    # Clear CUDA cache between items
+                    clear_cuda_cache()
+            
+            except Exception as e:
+                logger.error(f"Critical error processing queue item: {e}")
+                with queue_lock:
+                    item['status'] = 'failed'
+                    item['error'] = str(e)
+        
+        # Save queue summary
+        summary_path = os.path.join(queue_folder, 'queue_summary.json')
+        completed_count = sum(1 for r in results_summary if r['status'] == 'completed')
+        failed_count = sum(1 for r in results_summary if r['status'] == 'failed')
+        
+        with open(summary_path, 'w') as f:
+            json.dump({
+                'processed_at': datetime.now().isoformat(),
+                'total_files': len(results_summary),
+                'completed': completed_count,
+                'failed': failed_count,
+                'output_folder': queue_folder,
+                'results': results_summary
+            }, f, indent=2)
+        
+        logger.info("")
+        logger.info("=" * 60)
+        logger.info(f"QUEUE PROCESSING COMPLETE!")
+        logger.info(f"Total: {len(results_summary)} | Completed: {completed_count} | Failed: {failed_count}")
+        logger.info(f"Results saved to: {queue_folder}")
+        logger.info("=" * 60)
+        logger.info("")
+        
+        update_progress('idle', '', '', 0, 0)
+        current_queue_id = None
+        
+        return jsonify({
+            'status': 'success',
+            'queue_folder': queue_folder,
+            'completed': completed_count,
+            'failed': failed_count,
+            'total': len(results_summary),
+            'results': results_summary
+        })
+    
+    except Exception as e:
+        logger.error(f"Error processing queue: {e}")
+        update_progress('idle', '', '', 0, 0)
+        current_queue_id = None
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/queue/clear', methods=['POST'])
+def clear_queue():
+    """Clear all items from the queue"""
+    global processing_queue
+    
+    with queue_lock:
+        # Clean up temp files
+        for item in processing_queue:
+            if 'temp_path' in item and os.path.exists(item['temp_path']):
+                try:
+                    os.remove(item['temp_path'])
+                except Exception as e:
+                    logger.warning(f"Failed to remove temp file {item['temp_path']}: {e}")
+        
+        processing_queue.clear()
+    
+    return jsonify({'status': 'success', 'message': 'Queue cleared'})
+
+@app.route('/queue/remove/<int:item_id>', methods=['DELETE'])
+def remove_from_queue(item_id):
+    """Remove a specific item from the queue"""
+    global processing_queue
+    
+    with queue_lock:
+        for i, item in enumerate(processing_queue):
+            if item['id'] == item_id:
+                # Clean up temp file
+                if 'temp_path' in item and os.path.exists(item['temp_path']):
+                    try:
+                        os.remove(item['temp_path'])
+                    except Exception as e:
+                        logger.warning(f"Failed to remove temp file: {e}")
+                
+                processing_queue.pop(i)
+                return jsonify({'status': 'success', 'message': f'Item {item_id} removed'})
+        
+        return jsonify({'status': 'error', 'message': 'Item not found'}), 404
 
 @app.route('/outputs/<path:filename>', methods=['GET'])
 def serve_output_file(filename):
