@@ -1,6 +1,7 @@
 const { ipcRenderer } = require('electron');
 const { marked } = require('marked');
 const JSZip = require('jszip');
+const path = require('path');
 
 // DOM Elements
 const dropZone = document.getElementById('drop-zone');
@@ -15,6 +16,7 @@ const loadModelBtn = document.getElementById('load-model-btn');
 const copyBtn = document.getElementById('copy-btn');
 const previewSection = document.getElementById('preview-section');
 const imagePreview = document.getElementById('image-preview');
+const selectedFileLabel = document.getElementById('selected-file-label');
 const resultsContent = document.getElementById('results-content');
 const ocrPreviewImage = document.getElementById('ocr-preview-image');
 const ocrBoxesOverlay = document.getElementById('ocr-boxes-overlay');
@@ -103,6 +105,10 @@ let isQueueProcessing = false;
 let currentQueueFolder = null;
 let lastProcessedFileId = null;
 let startupHideTimer = null;
+
+function isPdfPath(filePath) {
+    return path.extname(filePath || '').toLowerCase() === '.pdf';
+}
 
 window.addEventListener('DOMContentLoaded', () => {
     marked.setOptions({
@@ -203,10 +209,11 @@ function setupEventListeners() {
         const files = e.dataTransfer.files;
         if (files.length > 0) {
             const file = files[0];
-            if (file.type.startsWith('image/')) {
+            const droppedPath = file.path || '';
+            if (file.type.startsWith('image/') || file.type === 'application/pdf' || isPdfPath(droppedPath)) {
                 loadImage(file.path);
             } else {
-                showMessage('Please drop an image file', 'error');
+                showMessage('Please drop an image or PDF file', 'error');
             }
         }
     });
@@ -302,7 +309,24 @@ async function selectImage() {
 
 async function loadImage(filePath) {
     currentImagePath = filePath;
-    imagePreview.src = filePath;
+    const isPdf = isPdfPath(filePath);
+    const fileName = path.basename(filePath);
+
+    if (isPdf) {
+        imagePreview.src = '';
+        imagePreview.style.display = 'none';
+        if (selectedFileLabel) {
+            selectedFileLabel.textContent = `PDF: ${fileName}`;
+            selectedFileLabel.style.display = 'block';
+        }
+    } else {
+        imagePreview.src = filePath;
+        imagePreview.style.display = 'block';
+        if (selectedFileLabel) {
+            selectedFileLabel.textContent = fileName;
+            selectedFileLabel.style.display = 'block';
+        }
+    }
 
     dropZone.style.display = 'none';
     previewSection.style.display = 'block';
@@ -331,6 +355,11 @@ function clearImage() {
     currentRawTokens = null;
     currentPromptType = null;
     imagePreview.src = '';
+    imagePreview.style.display = 'block';
+    if (selectedFileLabel) {
+        selectedFileLabel.textContent = '';
+        selectedFileLabel.style.display = 'none';
+    }
 
     dropZone.style.display = 'block';
     previewSection.style.display = 'none';
@@ -371,12 +400,20 @@ function closeLightbox() {
 
 function viewOriginalImage() {
     if (currentImagePath) {
+        if (isPdfPath(currentImagePath)) {
+            showMessage('Original preview is not available for PDF files', 'warning');
+            return;
+        }
         openLightbox(currentImagePath);
     }
 }
 
 async function viewBoxesImage() {
     if (!currentImagePath) return;
+    if (isPdfPath(currentImagePath)) {
+        showMessage('Boxes image view is only available for image files', 'warning');
+        return;
+    }
 
     // Create a canvas to render the image with boxes
     const canvas = document.createElement('canvas');
@@ -1122,21 +1159,20 @@ async function addFolderToQueue() {
     const result = await ipcRenderer.invoke('select-folder');
     
     if (result.success) {
-        // Get all image files from folder
+        // Get all supported files from folder
         const fs = require('fs');
-        const path = require('path');
         
         try {
             const files = fs.readdirSync(result.folderPath);
-            const imageExts = ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp'];
+            const inputExts = ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.pdf'];
             const imagePaths = files
-                .filter(file => imageExts.includes(path.extname(file).toLowerCase()))
+                .filter(file => inputExts.includes(path.extname(file).toLowerCase()))
                 .map(file => path.join(result.folderPath, file));
             
             if (imagePaths.length > 0) {
                 await addToQueue(imagePaths);
             } else {
-                showMessage('No image files found in folder', 'warning');
+                showMessage('No image/PDF files found in folder', 'warning');
             }
         } catch (error) {
             showMessage(`Error reading folder: ${error.message}`, 'error');

@@ -6,6 +6,7 @@ tokenizers>=0.20.0
 flask>=3.0.0
 flask-cors>=4.0.0
 Pillow>=10.0.0
+pypdfium2>=4.30.0
 addict>=2.4.0
 matplotlib>=3.7.0
 einops>=0.7.0

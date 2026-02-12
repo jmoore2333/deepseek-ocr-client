@@ -6,6 +6,7 @@ Handles model loading, caching, and OCR inference
 import os
 import sys
 import logging
+import re
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 import torch
@@ -359,6 +360,106 @@ def get_result_filename(prompt_type):
         return 'result.mmd'
     return 'result.txt'
 
+
+SUPPORTED_INPUT_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.pdf'}
+PDF_RENDER_SCALE = 2.0
+
+
+def get_input_suffix(filename):
+    suffix = Path(filename or '').suffix.lower()
+    if suffix in SUPPORTED_INPUT_EXTENSIONS:
+        return suffix
+    return '.jpg'
+
+
+def is_pdf_input(input_path):
+    return Path(input_path).suffix.lower() == '.pdf'
+
+
+def clear_output_artifacts(output_dir):
+    for filename in ('result.txt', 'result.mmd', 'result_with_boxes.jpg'):
+        target = os.path.join(output_dir, filename)
+        if os.path.exists(target):
+            os.remove(target)
+    images_dir = os.path.join(output_dir, 'images')
+    if os.path.isdir(images_dir):
+        for entry in os.scandir(images_dir):
+            if entry.is_file():
+                os.remove(entry.path)
+
+
+def read_result_text(output_dir, expected_output_file):
+    result_path = os.path.join(output_dir, expected_output_file)
+    if os.path.exists(result_path):
+        with open(result_path, 'r', encoding='utf-8') as f:
+            return f.read()
+
+    for filename in os.listdir(output_dir):
+        if filename.endswith(('.txt', '.mmd', '.md')):
+            with open(os.path.join(output_dir, filename), 'r', encoding='utf-8') as f:
+                return f.read()
+    return None
+
+
+def strip_markdown_image_refs(markdown_text):
+    if not markdown_text:
+        return markdown_text
+    return re.sub(r'!\[[^\]]*\]\(images\/[^)]+\)', '', markdown_text)
+
+
+def combine_pdf_results(page_results, prompt_type):
+    if not page_results:
+        return ''
+
+    if prompt_type == 'document':
+        chunks = []
+        for page_num, text in enumerate(page_results, start=1):
+            cleaned = (text or '').strip() or '(No text extracted)'
+            chunks.append(f'## Page {page_num}\n\n{cleaned}')
+        return '\n\n'.join(chunks).strip()
+
+    chunks = []
+    for page_num, text in enumerate(page_results, start=1):
+        cleaned = (text or '').strip()
+        chunks.append(f'--- Page {page_num} ---\n{cleaned}')
+    return '\n\n'.join(chunks).strip()
+
+
+def render_pdf_to_images(pdf_path, output_dir):
+    try:
+        import pypdfium2 as pdfium
+    except ImportError as exc:
+        raise RuntimeError('PDF support requires pypdfium2. Please reinstall dependencies.') from exc
+
+    os.makedirs(output_dir, exist_ok=True)
+    pdf = pdfium.PdfDocument(pdf_path)
+    page_paths = []
+    try:
+        for page_idx in range(len(pdf)):
+            page = pdf[page_idx]
+            pil_image = page.render(scale=PDF_RENDER_SCALE).to_pil()
+            page_path = os.path.join(output_dir, f'page_{page_idx + 1:04d}.jpg')
+            pil_image.save(page_path, format='JPEG', quality=95)
+            page_paths.append(page_path)
+    finally:
+        try:
+            pdf.close()
+        except Exception:
+            pass
+
+    if not page_paths:
+        raise RuntimeError('The PDF does not contain any renderable pages.')
+    return page_paths
+
+
+def extract_raw_token_section(accumulated_text):
+    if not accumulated_text:
+        return None
+    parts = accumulated_text.split('=' * 20)
+    if len(parts) < 3:
+        return None
+    return parts[2].strip().lstrip('=').strip()
+
 @app.route('/health', methods=['GET'])
 def health_check():
     """Health check endpoint"""
@@ -387,9 +488,10 @@ def load_model_endpoint():
 
 @app.route('/ocr', methods=['POST'])
 def perform_ocr():
-    """Perform OCR on uploaded image"""
+    """Perform OCR on an uploaded image or PDF"""
     global model, tokenizer, device, dtype
 
+    temp_input_path = None
     try:
         # Check if model is loaded
         if model is None or tokenizer is None:
@@ -397,113 +499,108 @@ def perform_ocr():
             if not load_model():
                 return jsonify({'status': 'error', 'message': 'Failed to load model'}), 500
 
-        # Get image from request
+        # Get file from request
         if 'image' not in request.files:
-            return jsonify({'status': 'error', 'message': 'No image provided'}), 400
+            return jsonify({'status': 'error', 'message': 'No file provided'}), 400
 
-        image_file = request.files['image']
+        input_file = request.files['image']
+        input_suffix = get_input_suffix(input_file.filename)
 
         # Get optional parameters
         prompt_type = request.form.get('prompt_type', 'document')
         base_size = int(request.form.get('base_size', 1024))
         image_size = int(request.form.get('image_size', 640))
         crop_mode = request.form.get('crop_mode', 'true').lower() == 'true'
-
-        # Define prompts and their expected output file extensions
-        prompt_configs = {
-            'document': {
-                'prompt': '<image>\n<|grounding|>Convert the document to markdown. ',
-                'output_file': 'result.mmd'
-            },
-            'ocr': {
-                'prompt': '<image>\n<|grounding|>OCR this image. ',
-                'output_file': 'result.txt'
-            },
-            'free': {
-                'prompt': '<image>\nFree OCR. ',
-                'output_file': 'result.txt'
-            },
-            'figure': {
-                'prompt': '<image>\nParse the figure. ',
-                'output_file': 'result.txt'
-            },
-            'describe': {
-                'prompt': '<image>\nDescribe this image in detail. ',
-                'output_file': 'result.txt'
-            }
-        }
-
-        config = prompt_configs.get(prompt_type, prompt_configs['document'])
-        prompt = config['prompt']
-        expected_output_file = config['output_file']
+        prompt = get_prompt_for_type(prompt_type)
+        expected_output_file = get_result_filename(prompt_type)
 
         logger.info(f"Processing OCR request with prompt type: {prompt_type}")
 
-        # Save image temporarily
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as tmp_file:
-            image_file.save(tmp_file.name)
-            temp_image_path = tmp_file.name
+        # Save input temporarily
+        with tempfile.NamedTemporaryFile(delete=False, suffix=input_suffix) as tmp_file:
+            input_file.save(tmp_file.name)
+            temp_input_path = tmp_file.name
 
         # Create output directory if it doesn't exist
         os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-        # Perform inference - save results to files with token counting
         logger.info("Running OCR inference...")
         logger.info(f"Saving results to: {OUTPUT_DIR}")
 
         # Reset progress
         update_progress('processing', 'ocr', 'Starting OCR...', 0, 0)
 
-        # Capture stdout to count characters and collect raw tokens
+        if is_pdf_input(temp_input_path):
+            logger.info("PDF input detected - rendering pages before OCR")
+            with tempfile.TemporaryDirectory(prefix='ocr_pdf_pages_') as page_dir:
+                page_images = render_pdf_to_images(temp_input_path, page_dir)
+                total_pages = len(page_images)
+                page_results = []
+
+                for page_idx, page_image in enumerate(page_images, start=1):
+                    update_progress(
+                        'processing',
+                        'ocr',
+                        f'Processing PDF page {page_idx}/{total_pages}...',
+                        int(((page_idx - 1) / total_pages) * 95),
+                        0
+                    )
+                    clear_output_artifacts(OUTPUT_DIR)
+                    run_model_infer(
+                        prompt=prompt,
+                        image_file=page_image,
+                        output_path=OUTPUT_DIR,
+                        base_size=base_size,
+                        image_size=image_size,
+                        crop_mode=crop_mode,
+                        save_results=True,
+                        test_compress=True
+                    )
+                    page_text = read_result_text(OUTPUT_DIR, expected_output_file) or ''
+                    if prompt_type == 'document':
+                        page_text = strip_markdown_image_refs(page_text)
+                    page_results.append(page_text)
+
+                result_text = combine_pdf_results(page_results, prompt_type)
+
+            return jsonify({
+                'status': 'success',
+                'result': result_text or 'OCR completed but no text was generated',
+                'boxes_image_path': None,
+                'prompt_type': prompt_type,
+                'raw_tokens': None,
+                'is_pdf': True,
+                'page_count': len(page_results)
+            })
+
+        # Image flow with token streaming progress
+        clear_output_artifacts(OUTPUT_DIR)
         old_stdout = sys.stdout
-        char_count = [0]  # Use list for mutable access in nested function
+        char_count = [0]
 
         class CharCountingStream:
             def __init__(self, original_stdout):
                 self.original = original_stdout
-                self.accumulated_text = ''  # Accumulate all text
-                self.section_count = 0  # Count === markers to track sections
+                self.accumulated_text = ''
 
             def write(self, text):
-                # Handle Unicode encoding errors gracefully
                 try:
                     self.original.write(text)
                 except UnicodeEncodeError:
-                    # If stdout can't handle the character, encode with error replacement
                     try:
-                        safe_text = text.encode(self.original.encoding or 'utf-8', errors='replace').decode(self.original.encoding or 'utf-8')
+                        safe_text = text.encode(
+                            self.original.encoding or 'utf-8',
+                            errors='replace'
+                        ).decode(self.original.encoding or 'utf-8')
                         self.original.write(safe_text)
                     except Exception:
-                        # If all else fails, just skip writing to original stdout
                         pass
 
-                # Accumulate text exactly as received (preserves all formatting)
                 self.accumulated_text += text
-
-                # Count === markers to determine sections
-                # Section 0-1: Before first ===
-                # Section 1-2: BASE/PATCHES info
-                # Section 2-3: Token generation (what we want)
-                # Section 3+: Compression stats
-                self.section_count = self.accumulated_text.count('=' * 20)  # Count long === lines
-
-                # Extract and process token section (between 2nd and 3rd ===)
-                if self.section_count >= 2:
-                    # Find the token section
-                    parts = self.accumulated_text.split('=' * 20)
-                    if len(parts) >= 3:
-                        # Token section is between 2nd and 3rd === markers
-                        token_section = parts[2]
-
-                        # Store the raw token section, removing any leading/trailing = and whitespace
-                        raw_token_text = token_section.strip().lstrip('=').strip()
-
-                        # Count characters in the raw token text
-                        char_count[0] = len(raw_token_text)
-
-                        # Update progress with the raw token stream (no artificial newlines)
-                        if char_count[0] > 0:
-                            update_progress('processing', 'ocr', 'Generating OCR...', 50, char_count[0], raw_token_text)
+                raw_token_text = extract_raw_token_section(self.accumulated_text)
+                if raw_token_text:
+                    char_count[0] = len(raw_token_text)
+                    update_progress('processing', 'ocr', 'Generating OCR...', 50, char_count[0], raw_token_text)
 
             def flush(self):
                 self.original.flush()
@@ -514,7 +611,7 @@ def perform_ocr():
         try:
             run_model_infer(
                 prompt=prompt,
-                image_file=temp_image_path,
+                image_file=temp_input_path,
                 output_path=OUTPUT_DIR,
                 base_size=base_size,
                 image_size=image_size,
@@ -524,53 +621,16 @@ def perform_ocr():
             )
         finally:
             sys.stdout = old_stdout
-            update_progress('idle', '', '', 0, 0)  # Reset progress
 
         logger.info("OCR inference completed successfully")
-
-        # Read the expected output file based on prompt type
-        result_filepath = os.path.join(OUTPUT_DIR, expected_output_file)
-        result_text = None
-
-        logger.info(f"Looking for output file: {expected_output_file}")
-        logger.info(f"Files in output dir: {os.listdir(OUTPUT_DIR)}")
-
-        if os.path.exists(result_filepath):
-            with open(result_filepath, 'r', encoding='utf-8') as f:
-                result_text = f.read()
-            logger.info(f"Successfully read result from: {expected_output_file}")
-            logger.info(f"Result text (first 200 chars): {result_text[:200]}")
-        else:
-            # Fallback: try to find any text-like file
-            logger.warning(f"Expected file '{expected_output_file}' not found, searching for alternatives")
-            for filename in os.listdir(OUTPUT_DIR):
-                if filename.endswith(('.txt', '.mmd', '.md')):
-                    filepath = os.path.join(OUTPUT_DIR, filename)
-                    with open(filepath, 'r', encoding='utf-8') as f:
-                        result_text = f.read()
-                    logger.info(f"Read result from alternative file: {filename}")
-                    break
-
+        result_text = read_result_text(OUTPUT_DIR, expected_output_file)
         if result_text is None:
             result_text = "OCR completed but no text file was generated"
             logger.warning("No result file found in output directory")
 
-        # Check for boxes image (result_with_boxes.jpg)
         boxes_image_path = os.path.join(OUTPUT_DIR, 'result_with_boxes.jpg')
         has_boxes_image = os.path.exists(boxes_image_path)
-
-        logger.info(f"Boxes image exists: {has_boxes_image}")
-
-        # Clean up temporary image file
-        if os.path.exists(temp_image_path):
-            os.remove(temp_image_path)
-
-        # Extract raw token text from the stream (between 2nd and 3rd === markers)
-        raw_token_text = None
-        if char_stream.section_count >= 2:
-            parts = char_stream.accumulated_text.split('=' * 20)
-            if len(parts) >= 3:
-                raw_token_text = parts[2].strip().lstrip('=').strip()
+        raw_token_text = extract_raw_token_section(char_stream.accumulated_text)
 
         return jsonify({
             'status': 'success',
@@ -588,6 +648,10 @@ def perform_ocr():
             'status': 'error',
             'message': str(e)
         }), 500
+    finally:
+        if temp_input_path and os.path.exists(temp_input_path):
+            os.remove(temp_input_path)
+        update_progress('idle', '', '', 0, 0)
 
 @app.route('/model_info', methods=['GET'])
 def model_info():
@@ -622,8 +686,14 @@ def add_to_queue():
         with queue_lock:
             for file in files:
                 if file.filename:
+                    raw_suffix = Path(file.filename).suffix.lower()
+                    if raw_suffix and raw_suffix not in SUPPORTED_INPUT_EXTENSIONS:
+                        logger.warning(f"Skipping unsupported file type: {file.filename}")
+                        continue
+                    input_suffix = raw_suffix if raw_suffix in SUPPORTED_INPUT_EXTENSIONS else '.jpg'
+
                     # Save file temporarily
-                    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.jpg')
+                    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=input_suffix)
                     file.save(temp_file.name)
                     temp_file.close()
                     
@@ -631,6 +701,7 @@ def add_to_queue():
                         'id': len(processing_queue),
                         'filename': file.filename,
                         'temp_path': temp_file.name,
+                        'input_type': 'pdf' if input_suffix == '.pdf' else 'image',
                         'prompt_type': prompt_type,
                         'base_size': base_size,
                         'image_size': image_size,
@@ -642,6 +713,9 @@ def add_to_queue():
                     }
                     processing_queue.append(queue_item)
                     added_files.append({'id': queue_item['id'], 'filename': file.filename})
+
+        if not added_files:
+            return jsonify({'status': 'error', 'message': 'No supported image/PDF files were provided'}), 400
         
         return jsonify({
             'status': 'success',
@@ -750,75 +824,114 @@ def process_queue():
                 
                 # Perform OCR with progress tracking (similar to single file)
                 try:
-                    # Store current file path for frontend to display
-                    with queue_lock:
-                        item['current_image_path'] = item['temp_path']
-                    
-                    # Use character counting stream like in perform_ocr
-                    old_stdout = sys.stdout
-                    char_count = [0]
-                    
-                    class CharCountingStream:
-                        def __init__(self, original_stdout):
-                            self.original = original_stdout
-                            self.accumulated_text = ''
-                            self.section_count = 0
-                        
-                        def write(self, text):
-                            # Don't write to console (too verbose for queue)
-                            # But do accumulate for progress tracking
-                            self.accumulated_text += text
-                            self.section_count = self.accumulated_text.count('=' * 20)
-                            
-                            if self.section_count >= 2:
-                                parts = self.accumulated_text.split('=' * 20)
-                                if len(parts) >= 3:
-                                    raw_token_text = parts[2].strip().lstrip('=').strip()
-                                    char_count[0] = len(raw_token_text)
-                                    
-                                    # Update progress with raw token stream
-                                    if char_count[0] > 0:
-                                        progress_msg = f"[{idx + 1}/{len(items_to_process)}] {item['filename']}"
-                                        update_progress('processing', 'queue', progress_msg, 
-                                                      int((idx / len(items_to_process)) * 100), 
-                                                      char_count[0], raw_token_text)
-                                        
-                                        # Also update item progress
-                                        with queue_lock:
-                                            item['progress'] = min(int((char_count[0] / 1000) * 100), 90)
-                        
-                        def flush(self):
-                            pass
-                    
-                    char_stream = CharCountingStream(old_stdout)
-                    sys.stdout = char_stream
-                    
-                    try:
-                        run_model_infer(
-                            prompt=get_prompt_for_type(item['prompt_type']),
-                            image_file=item['temp_path'],
-                            output_path=file_output_dir,
-                            base_size=item['base_size'],
-                            image_size=item['image_size'],
-                            crop_mode=item['crop_mode'],
-                            save_results=True,
-                            test_compress=True
-                        )
-                    finally:
-                        sys.stdout = old_stdout  # Restore stdout
-                    
-                    # Read result
+                    prompt = get_prompt_for_type(item['prompt_type'])
                     result_file = get_result_filename(item['prompt_type'])
-                    result_path = os.path.join(file_output_dir, result_file)
-                    
                     result_text = None
-                    if os.path.exists(result_path):
-                        with open(result_path, 'r', encoding='utf-8') as f:
-                            result_text = f.read()
+                    page_count = 1
+
+                    if is_pdf_input(item['temp_path']):
+                        with tempfile.TemporaryDirectory(prefix='queue_pdf_pages_') as page_dir:
+                            page_images = render_pdf_to_images(item['temp_path'], page_dir)
+                            page_count = len(page_images)
+                            page_results = []
+
+                            for page_idx, page_image in enumerate(page_images, start=1):
+                                with queue_lock:
+                                    item['current_image_path'] = page_image
+                                    item['progress'] = int(((page_idx - 1) / page_count) * 100)
+
+                                page_progress = int(
+                                    ((idx + ((page_idx - 1) / page_count)) / max(len(items_to_process), 1)) * 100
+                                )
+                                update_progress(
+                                    'processing',
+                                    'queue',
+                                    f"[{idx + 1}/{len(items_to_process)}] {item['filename']} (page {page_idx}/{page_count})",
+                                    page_progress,
+                                    0
+                                )
+
+                                page_output_dir = os.path.join(file_output_dir, f'page_{page_idx:04d}')
+                                os.makedirs(page_output_dir, exist_ok=True)
+                                clear_output_artifacts(page_output_dir)
+
+                                run_model_infer(
+                                    prompt=prompt,
+                                    image_file=page_image,
+                                    output_path=page_output_dir,
+                                    base_size=item['base_size'],
+                                    image_size=item['image_size'],
+                                    crop_mode=item['crop_mode'],
+                                    save_results=True,
+                                    test_compress=True
+                                )
+
+                                page_text = read_result_text(page_output_dir, result_file) or ''
+                                if item['prompt_type'] == 'document':
+                                    page_text = strip_markdown_image_refs(page_text)
+                                page_results.append(page_text)
+
+                            result_text = combine_pdf_results(page_results, item['prompt_type'])
+                            with open(os.path.join(file_output_dir, result_file), 'w', encoding='utf-8') as f:
+                                f.write(result_text)
+                    else:
+                        with queue_lock:
+                            item['current_image_path'] = item['temp_path']
+
+                        old_stdout = sys.stdout
+                        char_count = [0]
+
+                        class CharCountingStream:
+                            def __init__(self):
+                                self.accumulated_text = ''
+
+                            def write(self, text):
+                                self.accumulated_text += text
+                                raw_token_text = extract_raw_token_section(self.accumulated_text)
+                                if raw_token_text:
+                                    char_count[0] = len(raw_token_text)
+                                    progress_msg = f"[{idx + 1}/{len(items_to_process)}] {item['filename']}"
+                                    update_progress(
+                                        'processing',
+                                        'queue',
+                                        progress_msg,
+                                        int((idx / len(items_to_process)) * 100),
+                                        char_count[0],
+                                        raw_token_text
+                                    )
+                                    with queue_lock:
+                                        item['progress'] = min(int((char_count[0] / 1000) * 100), 90)
+
+                            def flush(self):
+                                pass
+
+                        char_stream = CharCountingStream()
+                        sys.stdout = char_stream
+                        try:
+                            clear_output_artifacts(file_output_dir)
+                            run_model_infer(
+                                prompt=prompt,
+                                image_file=item['temp_path'],
+                                output_path=file_output_dir,
+                                base_size=item['base_size'],
+                                image_size=item['image_size'],
+                                crop_mode=item['crop_mode'],
+                                save_results=True,
+                                test_compress=True
+                            )
+                        finally:
+                            sys.stdout = old_stdout
+
+                        result_text = read_result_text(file_output_dir, result_file)
+
+                    if result_text is None:
+                        result_text = ''
                     
                     # Save metadata
                     metadata = {
                         'filename': item['filename'],
+                        'input_type': item.get('input_type', 'image'),
+                        'page_count': page_count,
                         'prompt_type': item['prompt_type'],
                         'base_size': item['base_size'],
                         'image_size': item['image_size'],
@@ -833,6 +946,7 @@ def process_queue():
                         item['status'] = 'completed'
                         item['progress'] = 100
                         item['result'] = result_text
+                        item['current_image_path'] = None
                     
                     logger.info(f"✓ Completed: {item['filename']} -> {file_output_dir}")
                     
@@ -848,6 +962,7 @@ def process_queue():
                     with queue_lock:
                         item['status'] = 'failed'
                         item['error'] = str(e)
+                        item['current_image_path'] = None
                     
                     results_summary.append({
                         'id': item['id'],

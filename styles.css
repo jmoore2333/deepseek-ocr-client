@@ -240,6 +240,16 @@ main {
     margin: 0 auto 12px auto;
 }
 
+.selected-file-label {
+    max-width: 240px;
+    font-size: 11px;
+    color: rgba(255, 255, 255, 0.9);
+    text-align: center;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
 .preview-section .btn {
     margin: 0 auto;
 }

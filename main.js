@@ -12,6 +12,15 @@ const PYTHON_SERVER_PORT = 5000;
 const PYTHON_SERVER_URL = `http://127.0.0.1:${PYTHON_SERVER_PORT}`;
 const TORCH_PRIMARY_PACKAGES = ['torch>=2.6.0', 'torchvision>=0.21.0', 'torchaudio>=2.6.0'];
 const TORCH_FALLBACK_PACKAGES = ['torch>=2.4.0', 'torchvision>=0.19.0', 'torchaudio>=2.4.0'];
+const INPUT_MIME_TYPES = {
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.png': 'image/png',
+  '.gif': 'image/gif',
+  '.bmp': 'image/bmp',
+  '.webp': 'image/webp',
+  '.pdf': 'application/pdf'
+};
 let startupStatus = {
   phase: 'booting',
   message: 'Starting application...',
@@ -43,6 +52,11 @@ function getVenvPythonPath(venvDir) {
     return path.join(venvDir, 'Scripts', 'python.exe');
   }
   return path.join(venvDir, 'bin', 'python');
+}
+
+function getMimeTypeForFile(filePath) {
+  const ext = path.extname(filePath).toLowerCase();
+  return INPUT_MIME_TYPES[ext] || 'application/octet-stream';
 }
 
 function getAppPaths() {
@@ -393,7 +407,7 @@ async function setupPythonEnvironmentWithUv(paths) {
   setStartupStatus('setup-verify', 'Verifying runtime environment...', 90);
   await runCommand(
     paths.venvPython,
-    ['-c', 'import flask, flask_cors, PIL, transformers, torch; print(f"torch={torch.__version__}")'],
+    ['-c', 'import flask, flask_cors, PIL, transformers, torch, pypdfium2; print(f"torch={torch.__version__}")'],
     { env: setupEnv, logPrefix: '[setup] ' }
   );
 
@@ -637,7 +651,7 @@ ipcMain.handle('select-image', async () => {
   const result = await dialog.showOpenDialog(mainWindow, {
     properties: ['openFile'],
     filters: [
-      { name: 'Images', extensions: ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp'] }
+      { name: 'Images and PDFs', extensions: ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp', 'pdf'] }
     ]
   });
 
@@ -651,7 +665,7 @@ ipcMain.handle('select-images', async () => {
   const result = await dialog.showOpenDialog(mainWindow, {
     properties: ['openFile', 'multiSelections'],
     filters: [
-      { name: 'Images', extensions: ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp'] }
+      { name: 'Images and PDFs', extensions: ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp', 'pdf'] }
     ]
   });
 
@@ -690,7 +704,7 @@ ipcMain.handle('perform-ocr', async (event, { imagePath, promptType, baseSize, i
     const imageBuffer = fs.readFileSync(imagePath);
     formData.append('image', imageBuffer, {
       filename: path.basename(imagePath),
-      contentType: 'image/jpeg'
+      contentType: getMimeTypeForFile(imagePath)
     });
 
     formData.append('prompt_type', promptType || 'document');
@@ -725,7 +739,7 @@ ipcMain.handle('add-to-queue', async (event, { filePaths, promptType, baseSize, 
       const imageBuffer = fs.readFileSync(filePath);
       formData.append('files', imageBuffer, {
         filename: path.basename(filePath),
-        contentType: 'image/jpeg'
+        contentType: getMimeTypeForFile(filePath)
       });
     }
 
