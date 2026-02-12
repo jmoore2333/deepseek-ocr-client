@@ -708,6 +708,7 @@ def add_to_queue():
                         'crop_mode': crop_mode,
                         'status': 'pending',
                         'progress': 0,
+                        'progress_detail': None,
                         'result': None,
                         'error': None
                     }
@@ -746,13 +747,15 @@ def get_queue_status():
                 'filename': item['filename'],
                 'status': item['status'],
                 'progress': item['progress'],
+                'progress_detail': item.get('progress_detail'),
                 'error': item['error']
             } for item in processing_queue],
             'current_file': {
                 'id': current_item['id'],
                 'filename': current_item['filename'],
                 'image_path': current_item.get('current_image_path'),
-                'progress': current_item['progress']
+                'progress': current_item['progress'],
+                'progress_detail': current_item.get('progress_detail')
             } if current_item else None
         }
     
@@ -810,6 +813,7 @@ def process_queue():
             try:
                 with queue_lock:
                     item['status'] = 'processing'
+                    item['progress_detail'] = 'Page 1/1'
                     current_queue_id = item['id']
                 
                 progress_msg = f"[{idx + 1}/{len(items_to_process)}] Processing {item['filename']}"
@@ -839,6 +843,7 @@ def process_queue():
                                 with queue_lock:
                                     item['current_image_path'] = page_image
                                     item['progress'] = int(((page_idx - 1) / page_count) * 100)
+                                    item['progress_detail'] = f"Page {page_idx}/{page_count}"
 
                                 page_progress = int(
                                     ((idx + ((page_idx - 1) / page_count)) / max(len(items_to_process), 1)) * 100
@@ -894,13 +899,14 @@ def process_queue():
                                     update_progress(
                                         'processing',
                                         'queue',
-                                        progress_msg,
+                                        f"{progress_msg} (page 1/1)",
                                         int((idx / len(items_to_process)) * 100),
                                         char_count[0],
                                         raw_token_text
                                     )
                                     with queue_lock:
                                         item['progress'] = min(int((char_count[0] / 1000) * 100), 90)
+                                        item['progress_detail'] = 'Page 1/1'
 
                             def flush(self):
                                 pass
@@ -945,6 +951,7 @@ def process_queue():
                     with queue_lock:
                         item['status'] = 'completed'
                         item['progress'] = 100
+                        item['progress_detail'] = None
                         item['result'] = result_text
                         item['current_image_path'] = None
                     
@@ -962,6 +969,7 @@ def process_queue():
                     with queue_lock:
                         item['status'] = 'failed'
                         item['error'] = str(e)
+                        item['progress_detail'] = None
                         item['current_image_path'] = None
                     
                     results_summary.append({
@@ -984,6 +992,8 @@ def process_queue():
                 with queue_lock:
                     item['status'] = 'failed'
                     item['error'] = str(e)
+                    item['progress_detail'] = None
+                    item['current_image_path'] = None
         
         # Save queue summary
         summary_path = os.path.join(queue_folder, 'queue_summary.json')

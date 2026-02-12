@@ -104,6 +104,7 @@ let queueItems = [];
 let isQueueProcessing = false;
 let currentQueueFolder = null;
 let lastProcessedFileId = null;
+let lastQueuePreviewImagePath = null;
 let startupHideTimer = null;
 
 function isPdfPath(filePath) {
@@ -1263,7 +1264,8 @@ function createQueueItemElement(item) {
     if (item.status === 'pending') {
         statusText = 'Waiting...';
     } else if (item.status === 'processing') {
-        statusText = `Processing... ${item.progress}%`;
+        const detail = item.progress_detail ? ` (${item.progress_detail})` : '';
+        statusText = `Processing... ${item.progress}%${detail}`;
     } else if (item.status === 'completed') {
         statusText = 'Completed ✓';
     } else if (item.status === 'failed') {
@@ -1309,6 +1311,7 @@ async function processQueue() {
         ocrBoxesOverlay.removeAttribute('viewBox');
         lastBoxCount = 0;
         lastProcessedFileId = null;  // Reset file tracking
+        lastQueuePreviewImagePath = null;
         resultsContent.innerHTML = '<p>Queue processing... watch here for real-time preview</p>';
         
         // Start polling for queue status updates
@@ -1384,26 +1387,38 @@ function startQueuePolling() {
                     const percent = progressData.progress_percent || 0;
                     progressStatus.textContent = `Loading model ${percent}% before processing queue...`;
                 } else if (progressData.status === 'processing') {
-                    // Show current file being processed
-                    progressStatus.textContent = progressData.message || 'Processing...';
-                    
                     // Update preview with current file if available
                     const queueStatusResult = await fetch('http://127.0.0.1:5000/queue/status');
                     const queueData = await queueStatusResult.json();
+
+                    if (progressData.message) {
+                        progressStatus.textContent = progressData.message;
+                    } else if (queueData.current_file) {
+                        const detail = queueData.current_file.progress_detail ? ` (${queueData.current_file.progress_detail})` : '';
+                        progressStatus.textContent = `Processing ${queueData.current_file.filename}${detail}`;
+                    } else {
+                        progressStatus.textContent = 'Processing...';
+                    }
                     
                     if (queueData.current_file && queueData.current_file.image_path) {
+                        const previewPath = queueData.current_file.image_path;
+                        const fileChanged = lastProcessedFileId !== queueData.current_file.id;
+                        const pageChanged = lastQueuePreviewImagePath !== previewPath;
+
                         // Check if we switched to a new file
-                        if (lastProcessedFileId !== queueData.current_file.id) {
+                        if (fileChanged || pageChanged) {
                             lastProcessedFileId = queueData.current_file.id;
+                            lastQueuePreviewImagePath = previewPath;
                             
                             // Reset boxes for new file
                             ocrBoxesOverlay.innerHTML = '';
                             ocrBoxesOverlay.removeAttribute('viewBox');
                             lastBoxCount = 0;
-                            resultsContent.innerHTML = `<p>Processing ${queueData.current_file.filename}...</p>`;
+                            const detail = queueData.current_file.progress_detail ? ` (${queueData.current_file.progress_detail})` : '';
+                            resultsContent.innerHTML = `<p>Processing ${queueData.current_file.filename}${detail}...</p>`;
                             
                             // Load new file image
-                            ocrPreviewImage.src = queueData.current_file.image_path;
+                            ocrPreviewImage.src = previewPath;
                             
                             // Wait for image to load
                             await new Promise((resolve) => {
