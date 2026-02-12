@@ -12,6 +12,31 @@ const PYTHON_SERVER_PORT = 5000;
 const PYTHON_SERVER_URL = `http://127.0.0.1:${PYTHON_SERVER_PORT}`;
 const TORCH_PRIMARY_PACKAGES = ['torch>=2.6.0', 'torchvision>=0.21.0', 'torchaudio>=2.6.0'];
 const TORCH_FALLBACK_PACKAGES = ['torch>=2.4.0', 'torchvision>=0.19.0', 'torchaudio>=2.4.0'];
+let startupStatus = {
+  phase: 'booting',
+  message: 'Starting application...',
+  progress: 0,
+  state: 'running',
+  updatedAt: Date.now()
+};
+
+function emitStartupStatus() {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('startup-status', startupStatus);
+  }
+}
+
+function setStartupStatus(phase, message, progress, state = 'running') {
+  startupStatus = {
+    phase,
+    message,
+    progress,
+    state,
+    updatedAt: Date.now()
+  };
+  console.log(`[startup] ${phase} ${progress}% ${message}`);
+  emitStartupStatus();
+}
 
 function getVenvPythonPath(venvDir) {
   if (process.platform === 'win32') {
@@ -303,6 +328,8 @@ async function installNonTorchDependencies(uvBinary, venvPython, requirementsFil
 }
 
 async function setupPythonEnvironmentWithUv(paths) {
+  setStartupStatus('setup-check', 'Checking local Python environment...', 10);
+
   if (!fs.existsSync(paths.requirementsFile)) {
     throw new Error(`requirements.txt not found: ${paths.requirementsFile}`);
   }
@@ -318,10 +345,12 @@ async function setupPythonEnvironmentWithUv(paths) {
     fs.existsSync(paths.venvPython)
   ) {
     console.log('[setup] Existing Python environment is valid');
+    setStartupStatus('setup-ready', 'Using existing Python environment', 35);
     return paths.venvPython;
   }
 
   console.log('[setup] Initializing Python environment with bundled uv');
+  setStartupStatus('setup-init', 'Initializing first-run Python setup...', 20);
   ensureDirectory(paths.pythonEnvRoot);
   ensureDirectory(paths.pythonInstallDir);
   ensureDirectory(paths.uvCacheDir);
@@ -330,11 +359,13 @@ async function setupPythonEnvironmentWithUv(paths) {
   const setupEnv = getUvSetupEnv(paths);
   const gpuTarget = detectGpuTarget();
   console.log(`[setup] Detected hardware target: ${gpuTarget.displayName}`);
+  setStartupStatus('setup-detect-hardware', `Detected ${gpuTarget.displayName}`, 25);
 
   if (fs.existsSync(paths.venvDir)) {
     fs.rmSync(paths.venvDir, { recursive: true, force: true });
   }
 
+  setStartupStatus('setup-install-python', 'Installing standalone Python runtime...', 35);
   await runCommand(
     uvBinary,
     ['python', 'install', '3.11', '--install-dir', paths.pythonInstallDir],
@@ -342,12 +373,14 @@ async function setupPythonEnvironmentWithUv(paths) {
   );
 
   const standalonePython = findStandalonePython(paths.pythonInstallDir);
+  setStartupStatus('setup-create-venv', 'Creating virtual environment...', 50);
   await runCommand(
     uvBinary,
     ['venv', paths.venvDir, '--python', standalonePython],
     { env: setupEnv, logPrefix: '[setup] ' }
   );
 
+  setStartupStatus('setup-install-deps', 'Installing Python dependencies...', 65);
   await installTorchWithFallback(uvBinary, paths.venvPython, gpuTarget, setupEnv);
   await installNonTorchDependencies(
     uvBinary,
@@ -357,6 +390,7 @@ async function setupPythonEnvironmentWithUv(paths) {
     setupEnv
   );
 
+  setStartupStatus('setup-verify', 'Verifying runtime environment...', 90);
   await runCommand(
     paths.venvPython,
     ['-c', 'import flask, flask_cors, PIL, transformers, torch; print(f"torch={torch.__version__}")'],
@@ -379,6 +413,7 @@ async function setupPythonEnvironmentWithUv(paths) {
     updated_at: new Date().toISOString()
   });
   console.log('[setup] Python environment setup complete');
+  setStartupStatus('setup-complete', 'Python environment ready', 95);
 
   return paths.venvPython;
 }
@@ -395,6 +430,9 @@ function createWindow() {
   });
 
   mainWindow.loadFile('index.html');
+  mainWindow.webContents.on('did-finish-load', () => {
+    emitStartupStatus();
+  });
 
   // Open external links in browser instead of Electron window
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
@@ -425,6 +463,7 @@ function createWindow() {
 
 async function startPythonServer() {
   console.log('Starting Python OCR server...');
+  setStartupStatus('backend-init', 'Preparing backend startup...', 5);
   const paths = getAppPaths();
 
   // Check if backend script exists
@@ -438,6 +477,7 @@ async function startPythonServer() {
   if (app.isPackaged) {
     pythonExecutable = await setupPythonEnvironmentWithUv(paths);
   } else {
+    setStartupStatus('dev-env', 'Using development Python environment', 20);
     // Development mode: prefer local venv and fall back to system Python.
     if (process.platform === 'win32') {
       const venvPython = path.join(__dirname, 'venv', 'Scripts', 'python.exe');
@@ -449,6 +489,7 @@ async function startPythonServer() {
   }
 
   console.log(`Using Python: ${pythonExecutable}`);
+  setStartupStatus('backend-launch', 'Launching OCR backend service...', 96);
 
   ensureDirectory(paths.pythonEnvRoot);
   ensureDirectory(paths.cacheRoot);
@@ -477,6 +518,7 @@ async function startPythonServer() {
       if (!resolved) {
         resolved = true;
         console.log('Python server is ready!');
+        setStartupStatus('ready', 'Application is ready', 100, 'ready');
         resolve();
       }
     };
@@ -504,6 +546,14 @@ async function startPythonServer() {
       console.log(`Python process exited with code ${code}`);
     });
 
+    pythonProcess.on('error', (error) => {
+      if (!resolved) {
+        resolved = true;
+        setStartupStatus('error', `Backend process failed: ${error.message}`, 100, 'error');
+        reject(new Error(`Failed to start Python backend process: ${error.message}`));
+      }
+    });
+
     // Wait for server to start with retry logic (timeout after 30 seconds)
     const startTime = Date.now();
     const maxWaitTime = 30000; // 30 seconds
@@ -516,6 +566,7 @@ async function startPythonServer() {
       if (elapsed >= maxWaitTime) {
         if (!resolved) {
           resolved = true;
+          setStartupStatus('error', 'Backend startup timed out', 100, 'error');
           reject(new Error('Python server failed to start within timeout'));
         }
         return;
@@ -561,6 +612,8 @@ ipcMain.handle('check-server-status', async () => {
     return { success: false, error: error.message };
   }
 });
+
+ipcMain.handle('get-startup-status', async () => startupStatus);
 
 ipcMain.handle('load-model', async () => {
   try {
@@ -741,17 +794,19 @@ ipcMain.handle('remove-from-queue', async (event, itemId) => {
 
 // App lifecycle
 app.whenReady().then(async () => {
+  createWindow();
+
   try {
     await startPythonServer();
-    createWindow();
   } catch (error) {
     console.error('Failed to start Python server:', error);
+    setStartupStatus('error', `Startup failed: ${error.message}`, 100, 'error');
     dialog.showErrorBox(
       'Startup Error',
       `Failed to start Python server: ${error.message}\n\n` +
-      'Ensure internet access is available for first-run dependency setup and try again.'
+      'Ensure internet access is available for first-run dependency setup and try again.\n' +
+      'The app will remain open so you can review setup status.'
     );
-    app.quit();
   }
 
   app.on('activate', function () {

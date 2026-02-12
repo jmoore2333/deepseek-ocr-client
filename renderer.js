@@ -31,6 +31,11 @@ const lightboxClose = document.querySelector('.lightbox-close');
 const serverStatus = document.getElementById('server-status');
 const modelStatus = document.getElementById('model-status');
 const gpuStatus = document.getElementById('gpu-status');
+const startupPanel = document.getElementById('startup-panel');
+const startupPhase = document.getElementById('startup-phase');
+const startupMessage = document.getElementById('startup-message');
+const startupPercent = document.getElementById('startup-percent');
+const startupProgressBar = document.getElementById('startup-progress-bar');
 
 // Form elements
 const promptType = document.getElementById('prompt-type');
@@ -51,6 +56,23 @@ const queueProgressBar = document.getElementById('queue-progress-bar');
 
 // Constants
 const DEEPSEEK_COORD_MAX = 999;
+const STARTUP_PHASE_LABELS = {
+    booting: 'Starting',
+    'setup-check': 'Checking Python environment',
+    'setup-ready': 'Using existing environment',
+    'setup-init': 'Initializing setup',
+    'setup-detect-hardware': 'Detecting hardware',
+    'setup-install-python': 'Installing Python',
+    'setup-create-venv': 'Creating virtual environment',
+    'setup-install-deps': 'Installing dependencies',
+    'setup-verify': 'Verifying environment',
+    'setup-complete': 'Setup complete',
+    'backend-init': 'Preparing backend',
+    'dev-env': 'Using development environment',
+    'backend-launch': 'Launching backend',
+    ready: 'Ready',
+    error: 'Startup error'
+};
 
 const KNOWN_TYPES = ['title', 'sub_title', 'text', 'table', 'image', 'image_caption', 'figure', 'caption', 'formula', 'list'];
 
@@ -80,6 +102,7 @@ let queueItems = [];
 let isQueueProcessing = false;
 let currentQueueFolder = null;
 let lastProcessedFileId = null;
+let startupHideTimer = null;
 
 window.addEventListener('DOMContentLoaded', () => {
     marked.setOptions({
@@ -88,10 +111,65 @@ window.addEventListener('DOMContentLoaded', () => {
         breaks: true
     });
 
+    initializeStartupStatus();
     checkServerStatus();
     setupEventListeners();
     setInterval(checkServerStatus, 5000);
 });
+
+function formatStartupPhase(phase) {
+    if (!phase) {
+        return 'Starting';
+    }
+    if (STARTUP_PHASE_LABELS[phase]) {
+        return STARTUP_PHASE_LABELS[phase];
+    }
+    return phase
+        .split('-')
+        .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+        .join(' ');
+}
+
+function renderStartupStatus(status) {
+    if (!startupPanel || !status) {
+        return;
+    }
+
+    const state = status.state || 'running';
+    const numericProgress = Number.isFinite(Number(status.progress)) ? Number(status.progress) : 0;
+    const progress = Math.max(0, Math.min(100, Math.round(numericProgress)));
+
+    if (startupHideTimer) {
+        clearTimeout(startupHideTimer);
+        startupHideTimer = null;
+    }
+
+    startupPanel.style.display = 'block';
+    startupPanel.setAttribute('data-state', state);
+    startupPhase.textContent = formatStartupPhase(status.phase);
+    startupMessage.textContent = status.message || 'Preparing application...';
+    startupPercent.textContent = `${progress}%`;
+    startupProgressBar.style.width = `${progress}%`;
+
+    if (state === 'ready') {
+        startupHideTimer = setTimeout(() => {
+            startupPanel.style.display = 'none';
+        }, 1600);
+    }
+}
+
+async function initializeStartupStatus() {
+    ipcRenderer.on('startup-status', (event, status) => {
+        renderStartupStatus(status);
+    });
+
+    try {
+        const status = await ipcRenderer.invoke('get-startup-status');
+        renderStartupStatus(status);
+    } catch (error) {
+        console.error('Failed to get startup status:', error);
+    }
+}
 
 function setupEventListeners() {
     // Image selection

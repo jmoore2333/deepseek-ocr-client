@@ -28,6 +28,16 @@
                             <span id="gpu-status" class="status-value">Unknown</span>
                         </div>
                     </div>
+                    <div id="startup-panel" class="startup-panel" data-state="running" style="display: none;">
+                        <div class="startup-head">
+                            <span id="startup-phase" class="startup-phase">Starting</span>
+                            <span id="startup-percent" class="startup-percent">0%</span>
+                        </div>
+                        <div id="startup-message" class="startup-message">Preparing application...</div>
+                        <div class="startup-progress-track">
+                            <div id="startup-progress-bar" class="startup-progress-bar"></div>
+                        </div>
+                    </div>
                     <div class="header-links">
                         <a href="https://huggingface.co/deepseek-ai/DeepSeek-OCR" target="_blank">Model HuggingFace</a>
                         <span class="link-divider">•</span>
