@@ -377,27 +377,8 @@ def setup_python_environment(python_executable):
     else:
         print(f"{CHECK} flash-attn already installed")
 
-    # Apply model syntax fix if needed
-    print("\nApplying DeepSeek OCR model patches...")
-    patch_script = Path(__file__).parent / "patch_model_syntax.py"
-    if patch_script.exists():
-        try:
-            result = subprocess.run(
-                [str(python_path), str(patch_script)],
-                capture_output=True,
-                text=True,
-                check=False
-            )
-            if "SUCCESS" in result.stdout:
-                print(f"{CHECK} Model syntax patches applied")
-            elif "already be patched" in result.stdout:
-                print(f"{CHECK} Model already patched")
-            elif "Cache path not found" in result.stdout:
-                print("  Model not downloaded yet - patch will be applied on first use")
-        except Exception as e:
-            print(f"  Warning: Could not apply model patches: {e}")
-    else:
-        print("  Warning: patch_model_syntax.py not found")
+    # Do not patch model source files in Hugging Face cache.
+    print("\nSkipping model source patching (not required).")
 
     return python_path
 

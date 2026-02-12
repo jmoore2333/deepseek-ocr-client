@@ -1,4 +1,6 @@
 const { ipcRenderer } = require('electron');
+const { marked } = require('marked');
+const JSZip = require('jszip');
 
 // DOM Elements
 const dropZone = document.getElementById('drop-zone');
@@ -80,13 +82,11 @@ let currentQueueFolder = null;
 let lastProcessedFileId = null;
 
 window.addEventListener('DOMContentLoaded', () => {
-    if (typeof marked !== 'undefined') {
-        marked.setOptions({
-            mangle: false,
-            headerIds: false,
-            breaks: true
-        });
-    }
+    marked.setOptions({
+        mangle: false,
+        headerIds: false,
+        breaks: true
+    });
 
     checkServerStatus();
     setupEventListeners();
@@ -921,7 +921,7 @@ function displayResults(result, promptType) {
     currentResultText = formattedResult;
 
     // Render markdown for document mode
-    if (promptType === 'document' && typeof marked !== 'undefined') {
+    if (promptType === 'document') {
         const cacheBuster = Date.now();
         const renderedMarkdown = formattedResult.replace(
             /!\[([^\]]*)\]\(images\/([^)]+)\)/g,

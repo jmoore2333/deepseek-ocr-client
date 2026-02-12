@@ -24,14 +24,45 @@ A real-time Electron-based desktop GUI for [DeepSeek-OCR](https://github.com/dee
 
 - Windows 10/11, other OS are experimental
 - Node.js 18+ ([download](https://nodejs.org/))
-- Python 3.10-3.12 ([download](https://www.python.org/)) - Note: PyTorch doesn't support 3.13+ yet
+- Python 3.10-3.12 ([download](https://www.python.org/)) - required for source/dev mode
 - NVIDIA GPU with CUDA (optional but recommended for 6x speedup)
+
+## Packaged Installer Runtime
+
+Packaged builds now bundle `uv` and perform deferred first-run setup:
+
+- Detect hardware target (`Apple Silicon MPS`, `NVIDIA CUDA`, or `CPU`)
+- Install standalone Python into app data
+- Create app-managed virtual environment
+- Install the matching PyTorch variant and remaining dependencies
+
+This means end users do not need a preinstalled Python when using installers.
+
+## Build Installers
+
+Windows (NSIS):
+
+- `powershell -ExecutionPolicy Bypass -File .\scripts\build-release.ps1`
+
+macOS/Linux:
+
+- `bash ./scripts/build-release.sh`
+
+Manual commands:
+
+- `npm run dist:win`
+- `npm run dist:mac`
+- `npm run dist:linux`
+
+The installer is generated in `dist/` as an `.exe` file.
+On first app launch, the packaged build creates a Python environment in app data
+and installs dependencies automatically.
 
 ## Quick Start (Windows)
 
 1. **Install Python 3.10-3.12** if not already installed ([Python 3.10 recommended](https://www.python.org/ftp/python/3.10.14/python-3.10.14-amd64.exe))
    - ⚠️ **Important**: Python 3.13+ is not supported (PyTorch limitation)
-   - The launcher will automatically detect compatible Python versions
+   - Source launcher scripts detect compatible Python versions automatically
 2. **Extract** the [ZIP file](https://github.com/ihatecsv/deepseek-ocr-client/archive/refs/heads/main.zip)
 3. **Run** `start-client.bat`
    - First run will automatically:
@@ -47,9 +78,9 @@ Note: if you have issues processing images but the model loads properly, please 
 
 ## Linux/macOS
 
-**Note:** Linux and macOS have not been tested yet. Use `start-client.sh` instead of `start-client.bat`.
+Use `start-client.sh` for source mode.
 
-**PRs welcome!** If you test on Linux/macOS and encounter issues, please open a pull request with fixes.
+For packaged builds, run `bash ./scripts/build-release.sh` on Linux/macOS to generate platform installers (`AppImage`/`deb` on Linux, `dmg` on macOS).
 
 ## Links
 

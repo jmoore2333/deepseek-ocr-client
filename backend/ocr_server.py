@@ -30,7 +30,31 @@ CORS(app)
 # Global variables for model and tokenizer
 model = None
 tokenizer = None
-MODEL_NAME = 'deepseek-ai/DeepSeek-OCR'
+device = 'cpu'
+dtype = torch.float32
+
+
+def get_preferred_device():
+    """Select runtime device based on availability or override."""
+    if 'DEVICE' in os.environ:
+        return os.environ['DEVICE'].lower()
+    if torch.cuda.is_available():
+        return 'cuda'
+    if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+        return 'mps'
+    return 'cpu'
+
+
+def get_preferred_model_name():
+    """Use upstream model for CUDA, MPS/CPU-compatible fork otherwise."""
+    if 'MODEL_NAME' in os.environ:
+        return os.environ['MODEL_NAME']
+    if get_preferred_device() == 'cuda':
+        return 'deepseek-ai/DeepSeek-OCR'
+    return 'Dogacel/DeepSeek-OCR-Metal-MPS'
+
+
+MODEL_NAME = get_preferred_model_name()
 
 # Queue processing state
 processing_queue = []
@@ -38,9 +62,13 @@ queue_lock = Lock()
 current_queue_id = None
 queue_results = {}
 
-# Use local cache directory relative to the app
+# Use a writable cache directory (override via env for packaged apps)
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-CACHE_DIR = os.path.join(SCRIPT_DIR, '..', 'cache')
+CACHE_DIR = os.environ.get('DEEPSEEK_OCR_CACHE_DIR')
+if CACHE_DIR:
+    CACHE_DIR = os.path.abspath(CACHE_DIR)
+else:
+    CACHE_DIR = os.path.join(SCRIPT_DIR, '..', 'cache')
 MODEL_CACHE_DIR = os.path.join(CACHE_DIR, 'models')
 OUTPUT_DIR = os.path.join(CACHE_DIR, 'outputs')
 
@@ -73,14 +101,13 @@ def update_progress(status, stage='', message='', progress_percent=0, chars_gene
         else:
             logger.info(f"Progress: {status} - {stage} - {message} ({progress_percent}%)")
 
-def check_gpu_availability():
-    """Check if CUDA is available"""
-    if torch.cuda.is_available():
-        logger.info(f"GPU available: {torch.cuda.get_device_name(0)}")
-        return True
+def log_selected_device(selected_device):
+    if selected_device == 'cuda':
+        logger.info(f"Using CUDA: {torch.cuda.get_device_name(0)}")
+    elif selected_device == 'mps':
+        logger.info("Using Apple Silicon GPU (MPS)")
     else:
-        logger.warning("No GPU available, will use CPU (this will be slow!)")
-        return False
+        logger.warning("Using CPU backend (this will be slower)")
 
 def get_cache_dir_size(directory):
     """Get total size of files in directory in bytes"""
@@ -95,9 +122,21 @@ def get_cache_dir_size(directory):
         pass
     return total
 
+
+def run_model_infer(**kwargs):
+    """Run model inference with device arguments when supported by the model."""
+    global model, tokenizer, device, dtype
+    if device == 'cuda':
+        return model.infer(tokenizer, **kwargs)
+    try:
+        return model.infer(tokenizer, device=torch.device(device), dtype=dtype, **kwargs)
+    except TypeError:
+        logger.warning("Model infer() does not accept explicit device/dtype, retrying default call")
+        return model.infer(tokenizer, **kwargs)
+
 def load_model_background():
     """Background thread function to load the model"""
-    global model, tokenizer
+    global model, tokenizer, device, dtype
 
     try:
         update_progress('loading', 'init', 'Initializing model loading...', 0)
@@ -107,8 +146,9 @@ def load_model_background():
         # Create cache directory if it doesn't exist
         os.makedirs(MODEL_CACHE_DIR, exist_ok=True)
 
-        # Check GPU availability
-        has_gpu = check_gpu_availability()
+        # Select and report runtime device
+        device = get_preferred_device()
+        log_selected_device(device)
 
         # Load tokenizer (10% progress)
         update_progress('loading', 'tokenizer', 'Loading tokenizer...', 10)
@@ -192,35 +232,39 @@ def load_model_background():
         update_progress('loading', 'gpu', 'Moving model to GPU...', 80)
         model = model.eval()
 
-        # Move to GPU if available with optimal dtype (85% progress)
+        # Move model to selected device (85% progress)
         update_progress('loading', 'gpu', 'Optimizing model on GPU...', 85)
-        if has_gpu:
-            # Determine best dtype based on GPU capability
+        if device == 'cuda':
             compute_cap = torch.cuda.get_device_capability()
             if compute_cap[0] >= 8:  # Ampere or newer (RTX 30/40/50 series)
-                model = model.cuda().to(torch.bfloat16)
-                logger.info(f"Model loaded on GPU with bfloat16 (Compute {compute_cap[0]}.{compute_cap[1]})")
+                dtype = torch.bfloat16
             else:  # Pascal/Turing (GTX 10/16 series, RTX 20 series)
-                model = model.cuda().to(torch.float16)
-                logger.info(f"Model loaded on GPU with float16 (Compute {compute_cap[0]}.{compute_cap[1]})")
+                dtype = torch.float16
+            model = model.cuda().to(dtype)
+            logger.info(f"Model loaded on CUDA with dtype={dtype} (Compute {compute_cap[0]}.{compute_cap[1]})")
+        elif device == 'mps':
+            dtype = torch.float16
+            model = model.to(torch.device('mps')).to(dtype)
+            logger.info("Model loaded on MPS with float16")
         else:
-            # CPU mode - use float32
-            logger.info("Model loaded on CPU (inference will be slower)")
+            dtype = torch.float32
+            model = model.to(torch.device('cpu')).to(dtype)
+            logger.info("Model loaded on CPU with float32")
 
         # Apply torch.compile for ~30% inference speedup (PyTorch 2.0+) (95% progress)
         update_progress('loading', 'optimize', 'Compiling model with torch.compile...', 95)
         try:
-            if hasattr(torch, 'compile') and has_gpu:
+            if hasattr(torch, 'compile') and device == 'cuda':
                 logger.info("Applying torch.compile for faster inference...")
                 model = torch.compile(model, mode="reduce-overhead")
                 logger.info("Model compiled successfully (expect ~30% speedup)")
             else:
-                logger.info("torch.compile not available or no GPU, skipping compilation")
+                logger.info("torch.compile unavailable or unsupported for current device, skipping compilation")
         except Exception as e:
             logger.warning(f"torch.compile failed: {e}, using uncompiled model")
 
-        # Warmup inference to initialize compiled graphs
-        if has_gpu:
+        # Warmup inference to initialize graphs
+        if device in ('cuda', 'mps'):
             update_progress('loading', 'warmup', 'Running warmup inference...', 98)
             logger.info("Running warmup inference...")
             try:
@@ -230,8 +274,19 @@ def load_model_background():
                 dummy_img = Image.fromarray(np.random.randint(0, 255, (100, 100, 3), dtype=np.uint8))
                 with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp:
                     dummy_img.save(tmp.name)
-                    # Run a quick inference (won't save results)
-                    logger.info("Warmup complete")
+                with tempfile.TemporaryDirectory() as warmup_output:
+                    run_model_infer(
+                        prompt='<image>\nFree OCR. ',
+                        image_file=tmp.name,
+                        output_path=warmup_output,
+                        base_size=512,
+                        image_size=512,
+                        crop_mode=False,
+                        save_results=False,
+                        test_compress=False
+                    )
+                    logger.info("Warmup inference complete")
+                if os.path.exists(tmp.name):
                     os.unlink(tmp.name)
             except Exception as e:
                 logger.warning(f"Warmup inference failed: {e}")
@@ -276,7 +331,7 @@ def load_model():
 
 def clear_cuda_cache():
     """Clear CUDA cache to free memory between processing"""
-    if torch.cuda.is_available():
+    if device == 'cuda' and torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
 
@@ -310,7 +365,8 @@ def health_check():
     return jsonify({
         'status': 'ok',
         'model_loaded': model is not None,
-        'gpu_available': torch.cuda.is_available()
+        'gpu_available': device in ('cuda', 'mps'),
+        'device_state': device
     })
 
 @app.route('/progress', methods=['GET'])
@@ -332,7 +388,7 @@ def load_model_endpoint():
 @app.route('/ocr', methods=['POST'])
 def perform_ocr():
     """Perform OCR on uploaded image"""
-    global model, tokenizer
+    global model, tokenizer, device, dtype
 
     try:
         # Check if model is loaded
@@ -456,8 +512,7 @@ def perform_ocr():
         sys.stdout = char_stream
 
         try:
-            model.infer(
-                tokenizer,
+            run_model_infer(
                 prompt=prompt,
                 image_file=temp_image_path,
                 output_path=OUTPUT_DIR,
@@ -541,8 +596,9 @@ def model_info():
         'model_name': MODEL_NAME,
         'cache_dir': MODEL_CACHE_DIR,
         'model_loaded': model is not None,
-        'gpu_available': torch.cuda.is_available(),
-        'gpu_name': torch.cuda.get_device_name(0) if torch.cuda.is_available() else None
+        'gpu_available': device in ('cuda', 'mps'),
+        'device_state': device,
+        'gpu_name': torch.cuda.get_device_name(0) if (device == 'cuda' and torch.cuda.is_available()) else None
     })
 
 @app.route('/queue/add', methods=['POST'])
@@ -631,7 +687,7 @@ def get_queue_status():
 @app.route('/queue/process', methods=['POST'])
 def process_queue():
     """Start processing the queue sequentially"""
-    global model, tokenizer, current_queue_id
+    global model, tokenizer, current_queue_id, device, dtype
     
     try:
         # Check if model is loaded, load it if not
@@ -738,8 +794,7 @@ def process_queue():
                     sys.stdout = char_stream
                     
                     try:
-                        model.infer(
-                            tokenizer,
+                        run_model_infer(
                             prompt=get_prompt_for_type(item['prompt_type']),
                             image_file=item['temp_path'],
                             output_path=file_output_dir,
