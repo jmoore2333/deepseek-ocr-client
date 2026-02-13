@@ -152,15 +152,32 @@ Renderer access is exposed through a restricted preload API:
 - `nodeIntegration: false`
 - IPC channels wrapped by explicit preload methods
 
+## MCP Server / Claude Code Plugin
+
+This project includes an MCP (Model Context Protocol) server that enables full programmatic control of the OCR application through Claude Code or any MCP-compatible LLM client.
+
+**What you can do:** Submit files for OCR, manage the processing queue, monitor progress, load models, export diagnostics, and manage retention — all through natural language in Claude Code.
+
+**Quick start:** The project-level config at `.claude/mcp_servers.json` activates automatically when you open Claude Code in this directory. Or install the plugin:
+
+```bash
+claude plugin install --path ./mcp-plugin
+```
+
+See [`docs/mcp-server.md`](docs/mcp-server.md) for full documentation, available tools/resources, and usage examples.
+
 ## Project Layout
 
 - `main.js`: Electron main process, runtime bootstrap, IPC, setup flow
 - `preload.js`: secure renderer bridge
 - `renderer.js`: UI logic
 - `backend/ocr_server.py`: Flask OCR backend + queue processing
+- `backend/mcp_server.py`: MCP server for LLM integration
+- `mcp-plugin/`: Claude Code plugin package
 - `runtime/`: bundled `uv` binaries
 - `scripts/`: release/test helpers
 - `tests/e2e/`: Playwright E2E suite + mock backend
+- `docs/`: analysis, testing strategy, and MCP documentation
 
 ## Troubleshooting
 

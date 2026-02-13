@@ -1,0 +1,14 @@
+{
+  "name": "deepseek-ocr",
+  "version": "1.0.0",
+  "description": "Full programmatic control of the DeepSeek OCR desktop application via MCP — submit files, manage queues, monitor progress, and run diagnostics through Claude Code.",
+  "author": {
+    "name": "Jeremy Moore",
+    "url": "https://github.com/jmoore2333"
+  },
+  "homepage": "https://github.com/jmoore2333/deepseek-ocr-client",
+  "repository": "https://github.com/jmoore2333/deepseek-ocr-client",
+  "license": "MIT",
+  "keywords": ["ocr", "deepseek", "mcp", "pdf", "image-processing", "queue"],
+  "mcpServers": "../.mcp.json"
+}
