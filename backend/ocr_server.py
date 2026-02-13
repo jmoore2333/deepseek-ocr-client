@@ -217,6 +217,8 @@ def invoke_infer_with_generation_cap(infer_call, max_new_tokens_cap):
     original_generate = generate_fn
     patched = False
 
+    cap_log_state = {'logged': False}
+
     @functools.wraps(original_generate)
     def capped_generate(*args, **gen_kwargs):
         requested = gen_kwargs.get('max_new_tokens')
@@ -227,6 +229,13 @@ def invoke_infer_with_generation_cap(infer_call, max_new_tokens_cap):
 
         if requested_int is None or requested_int > max_new_tokens_cap:
             gen_kwargs['max_new_tokens'] = max_new_tokens_cap
+        if not cap_log_state['logged']:
+            cap_log_state['logged'] = True
+            logger.info(
+                "Applying generation cap: requested_max_new_tokens=%s effective_max_new_tokens=%s",
+                requested_int if requested_int is not None else 'unset',
+                gen_kwargs.get('max_new_tokens')
+            )
         return original_generate(*args, **gen_kwargs)
 
     try:
@@ -251,6 +260,15 @@ def run_model_infer(**kwargs):
     max_new_tokens_cap = resolve_max_new_tokens_cap(kwargs.pop('max_new_tokens_cap', None))
 
     def invoke_infer():
+        logger.info(
+            "Inference settings: device=%s eval_mode=%s max_new_tokens_cap=%s base_size=%s image_size=%s crop_mode=%s",
+            device,
+            bool(kwargs.get('eval_mode', False)),
+            max_new_tokens_cap,
+            kwargs.get('base_size'),
+            kwargs.get('image_size'),
+            kwargs.get('crop_mode')
+        )
         if device == 'cuda':
             return model.infer(tokenizer, **kwargs)
         try:
@@ -586,20 +604,37 @@ def get_env_flag(name, default=False):
     return str(value).strip().lower() in ('1', 'true', 'yes', 'on')
 
 
-PDF_RENDER_SCALE = max(0.4, float(os.environ.get('DEEPSEEK_OCR_PDF_RENDER_SCALE', '1.15')))
-PDF_MAX_RENDER_SIDE = max(900, int(os.environ.get('DEEPSEEK_OCR_PDF_MAX_SIDE', '1400')))
+PREFERRED_DEVICE_HINT = get_preferred_device()
+PDF_RENDER_SCALE = max(0.4, float(os.environ.get('DEEPSEEK_OCR_PDF_RENDER_SCALE', '1.0')))
+PDF_MIN_RENDER_SIDE = max(
+    600,
+    int(os.environ.get('DEEPSEEK_OCR_PDF_MIN_SIDE', '800' if PREFERRED_DEVICE_HINT == 'mps' else '1000'))
+)
+PDF_MAX_RENDER_SIDE = max(
+    PDF_MIN_RENDER_SIDE,
+    int(os.environ.get('DEEPSEEK_OCR_PDF_MAX_SIDE', '1200' if PREFERRED_DEVICE_HINT == 'mps' else '1400'))
+)
 PDF_TARGET_SIDE_MULTIPLIER = max(
     1.0,
-    float(os.environ.get('DEEPSEEK_OCR_PDF_TARGET_SIDE_MULTIPLIER', '1.25'))
+    float(os.environ.get('DEEPSEEK_OCR_PDF_TARGET_SIDE_MULTIPLIER', '1.1' if PREFERRED_DEVICE_HINT == 'mps' else '1.25'))
 )
 PDF_FAST_MODE = get_env_flag('DEEPSEEK_OCR_PDF_FAST_MODE', True)
-PDF_FAST_BASE_SIZE_MAX = max(512, int(os.environ.get('DEEPSEEK_OCR_PDF_FAST_BASE_MAX', '768')))
-PDF_FAST_IMAGE_SIZE_MAX = max(320, int(os.environ.get('DEEPSEEK_OCR_PDF_FAST_IMAGE_MAX', '448')))
+PDF_FAST_BASE_SIZE_MAX = max(
+    512,
+    int(os.environ.get('DEEPSEEK_OCR_PDF_FAST_BASE_MAX', '640' if PREFERRED_DEVICE_HINT == 'mps' else '768'))
+)
+PDF_FAST_IMAGE_SIZE_MAX = max(
+    320,
+    int(os.environ.get('DEEPSEEK_OCR_PDF_FAST_IMAGE_MAX', '384' if PREFERRED_DEVICE_HINT == 'mps' else '448'))
+)
 PDF_FAST_DISABLE_CROP = get_env_flag('DEEPSEEK_OCR_PDF_FAST_DISABLE_CROP', True)
 PDF_EVAL_MODE = get_env_flag('DEEPSEEK_OCR_PDF_EVAL_MODE', True)
-PDF_MAX_NEW_TOKENS = max(128, int(os.environ.get('DEEPSEEK_OCR_PDF_MAX_NEW_TOKENS', '1024')))
+PDF_MAX_NEW_TOKENS = max(
+    128,
+    int(os.environ.get('DEEPSEEK_OCR_PDF_MAX_NEW_TOKENS', '384' if PREFERRED_DEVICE_HINT == 'mps' else '1024'))
+)
 
-DEFAULT_MAX_NEW_TOKENS_MPS = max(256, int(os.environ.get('DEEPSEEK_OCR_MAX_NEW_TOKENS_MPS', '1024')))
+DEFAULT_MAX_NEW_TOKENS_MPS = max(256, int(os.environ.get('DEEPSEEK_OCR_MAX_NEW_TOKENS_MPS', '768')))
 DEFAULT_MAX_NEW_TOKENS_OTHER = max(256, int(os.environ.get('DEEPSEEK_OCR_MAX_NEW_TOKENS_OTHER', '2048')))
 
 
@@ -635,7 +670,7 @@ def build_pdf_inference_profile(base_size, image_size, crop_mode):
             tuned_crop = False
 
     target_max_side = max(
-        1000,
+        PDF_MIN_RENDER_SIDE,
         min(
             PDF_MAX_RENDER_SIDE,
             int(max(tuned_base, tuned_image) * PDF_TARGET_SIDE_MULTIPLIER)
@@ -777,7 +812,7 @@ def render_pdf_to_images(pdf_path, output_dir, page_range_text=None, target_max_
         raise RuntimeError('PDF support requires pypdfium2. Please reinstall dependencies.') from exc
 
     os.makedirs(output_dir, exist_ok=True)
-    max_side = max(1000, int(target_max_side or PDF_MAX_RENDER_SIDE))
+    max_side = max(PDF_MIN_RENDER_SIDE, int(target_max_side or PDF_MAX_RENDER_SIDE))
     logger.info(
         f"Rendering PDF pages with base_scale={PDF_RENDER_SCALE:.2f}, max_side={max_side}"
     )
