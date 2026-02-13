@@ -1,128 +1,183 @@
-# DeepSeek-OCR Client
+# DeepSeek OCR Client (Fork)
 
-A real-time Electron-based desktop GUI for [DeepSeek-OCR](https://github.com/deepseek-ai/DeepSeek-OCR)
+Desktop Electron client for [DeepSeek-OCR](https://github.com/deepseek-ai/DeepSeek-OCR), with cross-platform packaging, queue workflows, GPU-aware setup, and first-run managed Python runtime.
 
-**Unaffiliated with [DeepSeek](https://www.deepseek.com/)**
+This project is unaffiliated with DeepSeek.
 
-## Features
+## What This Fork Adds
 
-- Drag-and-drop image upload
-- Drag-and-drop image/PDF upload
-- Real-time OCR processing
-- **NEW: Queue processing** - Process multiple files or entire folders automatically
-- **NEW: CUDA optimizations** - Up to 6x faster with GPU acceleration
+- Managed first-run runtime via bundled `uv` (packaged builds)
+- Hardware-aware setup path (Apple Silicon MPS, NVIDIA CUDA, CPU)
+- Queue processing for mixed image + PDF inputs
+- Queue controls: pause, resume, cancel, retry failed
+- PDF page-range support (`1-3,5`) for single OCR and queue OCR
+- Startup/setup progress UI
+- Preflight estimator (disk + download/time estimates)
+- Diagnostics bundle export (for debugging/support)
+- Retention policy UI (outputs/cache cleanup)
+- Security hardening: preload-based API with `contextIsolation: true`
+- Cross-platform E2E and packaging test coverage
 
-<img src="docs/images/document.gif" width="1000">
+## Platform Support
 
-- Click regions to copy 
-- Export results as ZIP with markdown images
-- GPU acceleration (CUDA) with torch.compile optimization
-- **NEW: Auto-save** - Queue results organized in timestamped folders
-
-<img src="docs/images/document2.png" width="1000">
+- macOS: source mode + DMG packaging
+- Windows: source mode + NSIS packaging
+- Linux: source mode + AppImage/deb packaging
 
 ## Requirements
 
-- Windows 10/11, other OS are experimental
-- Node.js 18+ ([download](https://nodejs.org/))
-- Python 3.10-3.12 ([download](https://www.python.org/)) - required for source/dev mode
-- NVIDIA GPU with CUDA (optional but recommended for 6x speedup)
+### End users (installer builds)
 
-## Packaged Installer Runtime
+- No preinstalled Python required
+- Internet access on first run (runtime + dependencies + model)
 
-Packaged builds now bundle `uv` and perform deferred first-run setup:
+### Source/development mode
 
-- Detect hardware target (`Apple Silicon MPS`, `NVIDIA CUDA`, or `CPU`)
-- Install standalone Python into app data
-- Create app-managed virtual environment
-- Install the matching PyTorch variant and remaining dependencies
+- Node.js 18+
+- Python 3.10-3.12
+- Optional: NVIDIA driver/CUDA-capable GPU for CUDA acceleration
 
-This means end users do not need a preinstalled Python when using installers.
+## Quick Start
 
-## Build Installers
+### 1. Clone and install Node deps
 
-Windows (NSIS):
+```bash
+npm ci
+```
 
-- `powershell -ExecutionPolicy Bypass -File .\scripts\build-release.ps1`
+### 2. Run in source mode
 
 macOS/Linux:
 
-- `bash ./scripts/build-release.sh`
+```bash
+./start-client.sh
+```
 
-Manual commands:
+Windows:
 
-- `npm run dist:win`
-- `npm run dist:mac`
-- `npm run dist:linux`
+```bat
+start-client.bat
+```
 
-The installer is generated in `dist/` as an `.exe` file.
-On first app launch, the packaged build creates a Python environment in app data
-and installs dependencies automatically.
+### 3. In the app
 
-## Testing (Cross-Platform E2E)
+1. Click `Load Model` (first time downloads model)
+2. Drop/select an image or PDF
+3. Click `Run OCR`
 
-The repository includes an end-to-end suite that runs against a deterministic mock backend (no model download required), plus host build/dist smoke checks.
+## Queue Workflow
 
-Install deps:
+- Add files or add a folder
+- Optional PDF page range: `1-3,5`
+- Click `Process Queue`
+- Use queue controls while running:
+  - `Pause`
+  - `Resume`
+  - `Cancel`
+  - `Retry Failed`
 
-- `npm ci`
+Queue outputs are written under timestamped folders in the app cache output directory.
 
-Run Electron E2E operations:
+## Basic vs Advanced Mode
 
-- `npm run test:e2e`
+- `Basic`: simplified UI for common OCR flow
+- `Advanced`: exposes tuning + diagnostics + retention controls
 
-Run host build smoke (`electron-builder --dir`):
+Mode is persisted locally.
 
-- `npm run test:build:smoke`
+## Preflight, Diagnostics, and Retention
 
-Run host distribution packaging:
+- `Run Preflight`: estimates required disk/download and expected setup time
+- `Export Diagnostics`: writes a ZIP with app/backend diagnostics and log tails
+- Retention policy panel:
+  - Output retention days
+  - Max queue run folders
+  - Download-cache retention days
+  - Optional cleanup on startup
 
-- `npm run test:dist:host`
+## Build Installers / Distributions
 
-CI workflows:
+### Windows (NSIS)
 
-- `.github/workflows/ci-e2e.yml` runs E2E + build smoke on Linux/macOS/Windows.
-- `.github/workflows/dist-matrix.yml` runs full host dist packaging on Linux/macOS/Windows (manual dispatch).
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\build-release.ps1
+```
 
-## Quick Start (Windows)
+### macOS/Linux
 
-1. **Install Python 3.10-3.12** if not already installed ([Python 3.10 recommended](https://www.python.org/ftp/python/3.10.14/python-3.10.14-amd64.exe))
-   - ⚠️ **Important**: Python 3.13+ is not supported (PyTorch limitation)
-   - Source launcher scripts detect compatible Python versions automatically
-2. **Extract** the [ZIP file](https://github.com/ihatecsv/deepseek-ocr-client/archive/refs/heads/main.zip)
-3. **Run** `start-client.bat`
-   - First run will automatically:
-     - Create a Python virtual environment
-     - Install PyTorch with CUDA support
-     - Install all dependencies
-   - Subsequent runs will start quicker
-4. **Load Model** - Click the "Load Model" button in the app (downloads model on first run)
-5. **Drop an image** or click the drop zone to select one
-6. **Run OCR** - Click "Run OCR" to process
+```bash
+bash ./scripts/build-release.sh
+```
 
-Note: if you have issues processing images but the model loads properly, please close and re-open the app and try with the default resolution for "base" and "size". This is a [known issue](https://github.com/ihatecsv/deepseek-ocr-client/issues/2), if you can help to fix it I would appreciate it!
+### Manual dist commands
 
-## Linux/macOS
+```bash
+npm run dist:win
+npm run dist:mac
+npm run dist:linux
+```
 
-Use `start-client.sh` for source mode.
+## Testing
 
-For packaged builds, run `bash ./scripts/build-release.sh` on Linux/macOS to generate platform installers (`AppImage`/`deb` on Linux, `dmg` on macOS).
+### Electron E2E (mock backend)
 
-## Links
+```bash
+npm run test:e2e
+```
 
-- [Model HuggingFace](https://huggingface.co/deepseek-ai/DeepSeek-OCR)
-- [Model Blog Post](https://deepseek.ai/blog/deepseek-ocr-context-compression)
-- [Model GitHub](https://github.com/deepseek-ai/DeepSeek-OCR)
+### Host build smoke
 
-## Future goals (PRs welcome!)
+```bash
+npm run test:build:smoke
+```
 
-- [ ] Code cleanup needed (quickly put together)
-- [ ] TypeScript
-- [ ] Updater from GitHub releases
-- [ ] Batch processing
-- [ ] CPU support?
-- [ ] Web version (so you can run the server on a different machine)
-- [ ] ???
+### Host dist packaging
+
+```bash
+npm run test:dist:host
+```
+
+## CI
+
+- `.github/workflows/ci-e2e.yml`
+  - E2E + build smoke on Linux/macOS/Windows
+- `.github/workflows/dist-matrix.yml`
+  - Full host distribution packaging matrix (manual dispatch)
+
+## Security Model
+
+Renderer access is exposed through a restricted preload API:
+
+- `contextIsolation: true`
+- `nodeIntegration: false`
+- IPC channels wrapped by explicit preload methods
+
+## Project Layout
+
+- `main.js`: Electron main process, runtime bootstrap, IPC, setup flow
+- `preload.js`: secure renderer bridge
+- `renderer.js`: UI logic
+- `backend/ocr_server.py`: Flask OCR backend + queue processing
+- `runtime/`: bundled `uv` binaries
+- `scripts/`: release/test helpers
+- `tests/e2e/`: Playwright E2E suite + mock backend
+
+## Troubleshooting
+
+- Model/setup issues:
+  - Run `Run Preflight` first, confirm disk/network are sufficient
+- Runtime/setup anomalies:
+  - Export diagnostics and inspect `diagnostics.json`
+- Queue stalls:
+  - Check queue state in UI (`paused`, `cancel requested`, failed items)
+
+## Upstream and Fork Context
+
+Original project:
+
+- [ihatecsv/deepseek-ocr-client](https://github.com/ihatecsv/deepseek-ocr-client)
+
+This repository is an actively maintained fork focused on installer/runtime reliability and multi-platform operation.
 
 ## License
 

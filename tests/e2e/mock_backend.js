@@ -11,6 +11,8 @@ const MOCK_QUEUE_FOLDER = path.join(os.tmpdir(), 'deepseek-ocr-mock-queue');
 let modelLoaded = false;
 let modelLoading = false;
 let queueProcessing = false;
+let queuePaused = false;
+let queueCancelRequested = false;
 let queueItems = [];
 let nextQueueId = 0;
 
@@ -76,6 +78,10 @@ function queueSummary() {
     processing: queueItems.filter((item) => item.status === 'processing').length,
     completed: queueItems.filter((item) => item.status === 'completed').length,
     failed: queueItems.filter((item) => item.status === 'failed').length,
+    paused: queuePaused,
+    cancel_requested: queueCancelRequested,
+    is_processing: queueProcessing,
+    can_retry_failed: queueItems.some((item) => item.status === 'failed'),
     items: queueItems.map((item) => ({
       id: item.id,
       filename: item.filename,
@@ -167,12 +173,17 @@ async function processMockQueue() {
   }
 
   queueProcessing = true;
+  queuePaused = false;
+  queueCancelRequested = false;
   const pendingItems = queueItems.filter((item) => item.status === 'pending');
   const results = [];
   const totalItems = Math.max(pendingItems.length, 1);
   const rawTokens = buildMockRawTokens();
 
   for (let itemIdx = 0; itemIdx < pendingItems.length; itemIdx += 1) {
+    if (queueCancelRequested) {
+      break;
+    }
     const item = pendingItems[itemIdx];
     const pageCount = item.filename.toLowerCase().endsWith('.pdf') ? 3 : 1;
 
@@ -180,6 +191,17 @@ async function processMockQueue() {
     item.error = null;
 
     for (let pageNum = 1; pageNum <= pageCount; pageNum += 1) {
+      while (queuePaused && !queueCancelRequested) {
+        item.progress_detail = `Page ${pageNum}/${pageCount} (Paused)`;
+        await sleep(80);
+      }
+      if (queueCancelRequested) {
+        item.status = 'pending';
+        item.progress = 0;
+        item.progress_detail = null;
+        item.current_image_path = null;
+        break;
+      }
       item.progress_detail = `Page ${pageNum}/${pageCount}`;
       item.current_image_path = null;
 
@@ -202,6 +224,9 @@ async function processMockQueue() {
         await sleep(90);
       }
     }
+    if (queueCancelRequested) {
+      break;
+    }
 
     item.status = 'completed';
     item.progress = 100;
@@ -218,6 +243,8 @@ async function processMockQueue() {
   }
 
   updateProgress('idle', '', '', 0, 0, '');
+  queuePaused = false;
+  queueCancelRequested = false;
   queueProcessing = false;
   return results;
 }
@@ -316,6 +343,7 @@ const server = http.createServer(async (req, res) => {
       const baseSize = Number(parseMultipartField(bodyText, 'base_size', '1024'));
       const imageSize = Number(parseMultipartField(bodyText, 'image_size', '640'));
       const cropMode = parseMultipartField(bodyText, 'crop_mode', 'true').toLowerCase() === 'true';
+      const pdfPageRange = parseMultipartField(bodyText, 'pdf_page_range', '').trim() || null;
 
       if (!filenames.length) {
         sendJson(res, { status: 'error', message: 'No files provided' }, 400);
@@ -335,7 +363,8 @@ const server = http.createServer(async (req, res) => {
           prompt_type: promptType,
           base_size: baseSize,
           image_size: imageSize,
-          crop_mode: cropMode
+          crop_mode: cropMode,
+          pdf_page_range: pdfPageRange
         };
         nextQueueId += 1;
         queueItems.push(item);
@@ -371,15 +400,74 @@ const server = http.createServer(async (req, res) => {
         completed,
         failed,
         total: results.length,
+        canceled: false,
         results
       });
       return;
     }
 
     if (req.method === 'POST' && pathname === '/queue/clear') {
+      if (queueProcessing) {
+        sendJson(res, { status: 'error', message: 'Cannot clear queue while processing' }, 409);
+        return;
+      }
       queueItems = [];
       updateProgress('idle', '', '', 0, 0, '');
       sendJson(res, { status: 'success', message: 'Queue cleared' });
+      return;
+    }
+
+    if (req.method === 'POST' && pathname === '/queue/pause') {
+      if (!queueProcessing) {
+        sendJson(res, { status: 'error', message: 'Queue is not processing' }, 409);
+        return;
+      }
+      queuePaused = true;
+      sendJson(res, { status: 'success', message: 'Queue paused' });
+      return;
+    }
+
+    if (req.method === 'POST' && pathname === '/queue/resume') {
+      if (!queueProcessing) {
+        sendJson(res, { status: 'error', message: 'Queue is not processing' }, 409);
+        return;
+      }
+      queuePaused = false;
+      sendJson(res, { status: 'success', message: 'Queue resumed' });
+      return;
+    }
+
+    if (req.method === 'POST' && pathname === '/queue/cancel') {
+      if (!queueProcessing) {
+        sendJson(res, { status: 'error', message: 'Queue is not processing' }, 409);
+        return;
+      }
+      queueCancelRequested = true;
+      queuePaused = false;
+      sendJson(res, { status: 'success', message: 'Queue cancellation requested' });
+      return;
+    }
+
+    if (req.method === 'POST' && pathname === '/queue/retry_failed') {
+      if (queueProcessing) {
+        sendJson(res, { status: 'error', message: 'Cannot retry while queue is processing' }, 409);
+        return;
+      }
+      let retried = 0;
+      queueItems = queueItems.map((item) => {
+        if (item.status === 'failed') {
+          retried += 1;
+          return {
+            ...item,
+            status: 'pending',
+            progress: 0,
+            progress_detail: null,
+            error: null
+          };
+        }
+        return item;
+      });
+      sendJson(res, { status: 'success', retried });
       return;
     }
 
@@ -393,6 +481,25 @@ const server = http.createServer(async (req, res) => {
       }
       queueItems.splice(idx, 1);
       sendJson(res, { status: 'success', message: `Item ${itemId} removed` });
+      return;
+    }
+
+    if (req.method === 'GET' && pathname === '/diagnostics') {
+      sendJson(res, {
+        timestamp: new Date().toISOString(),
+        runtime: {
+          node: process.version,
+          platform: process.platform
+        },
+        model: {
+          model_name: 'mock/deepseek-ocr',
+          loaded: modelLoaded,
+          device: 'cpu'
+        },
+        queue: queueSummary(),
+        progress: progressData,
+        logs_tail: ['mock backend diagnostics']
+      });
       return;
     }
 
