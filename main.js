@@ -129,7 +129,7 @@ function getAppPaths() {
   const userDataRoot = app.getPath('userData');
   const pythonEnvRoot = path.join(userDataRoot, 'python_env');
   const cacheRoot = path.join(userDataRoot, 'cache');
-  const huggingFaceRoot = path.join(pythonEnvRoot, 'huggingface');
+  const modelCacheDir = path.join(cacheRoot, 'models');
 
   const venvDir = path.join(pythonEnvRoot, 'venv');
 
@@ -147,7 +147,7 @@ function getAppPaths() {
     uvCacheDir: path.join(pythonEnvRoot, 'uv-cache'),
     pipCacheDir: path.join(pythonEnvRoot, 'pip-cache'),
     cacheRoot,
-    huggingFaceRoot
+    modelCacheDir
   };
 }
 
@@ -376,8 +376,8 @@ function buildPreflightReport(paths) {
   const setupMarker = readJsonFile(paths.setupMarkerPath);
   const hasManagedEnv = Boolean(setupMarker && fs.existsSync(paths.venvPython));
   const pythonEnvBytes = getDirectorySize(paths.pythonEnvRoot);
-  const hfCacheBytes = getDirectorySize(paths.huggingFaceRoot);
-  const modelLikelyPresent = hfCacheBytes > (800 * 1024 * 1024);
+  const modelCacheBytes = getDirectorySize(paths.modelCacheDir);
+  const modelLikelyPresent = modelCacheBytes > (800 * 1024 * 1024);
   const freeBytes = statDiskFreeBytes(app.getPath('userData'));
 
   const pythonSetupBytes = PREFLIGHT_ESTIMATES.pythonRuntimeBytes + PREFLIGHT_ESTIMATES.dependencyBytes;
@@ -399,7 +399,7 @@ function buildPreflightReport(paths) {
     setupComplete: hasManagedEnv,
     modelCachePresent: modelLikelyPresent,
     pythonEnvBytes,
-    huggingFaceBytes: hfCacheBytes,
+    modelCacheBytes,
     expectedDownloadBytes,
     expectedRequiredBytes,
     freeDiskBytes: freeBytes,
@@ -606,8 +606,8 @@ function detectGpuTarget() {
   if (process.platform === 'darwin') {
     return {
       id: 'cpu',
-      displayName: 'CPU (macOS)',
-      torchIndexUrl: null
+      displayName: 'CPU (macOS Intel)',
+      torchIndexUrl: 'https://download.pytorch.org/whl/cpu'
     };
   }
 
@@ -884,11 +884,12 @@ async function startPythonServer() {
 
     console.log(`Using Python: ${pythonExecutable}`);
     setStartupStatus('backend-launch', 'Launching OCR backend service...', 96);
+    const runtimeGpuTarget = detectGpuTarget();
+    console.log(`[backend] Runtime hardware target: ${runtimeGpuTarget.displayName}`);
 
     ensureDirectory(paths.pythonEnvRoot);
     ensureDirectory(paths.cacheRoot);
-    ensureDirectory(paths.huggingFaceRoot);
-    ensureDirectory(path.join(paths.huggingFaceRoot, 'hub'));
+    ensureDirectory(paths.modelCacheDir);
 
     backendCommand = pythonExecutable;
     backendArgs = [paths.backendScript];
@@ -896,9 +897,11 @@ async function startPythonServer() {
       ...process.env,
       PYTHONUNBUFFERED: '1',
       DEEPSEEK_OCR_CACHE_DIR: paths.cacheRoot,
-      HF_HOME: paths.huggingFaceRoot,
-      HF_HUB_CACHE: path.join(paths.huggingFaceRoot, 'hub'),
-      TRANSFORMERS_CACHE: path.join(paths.huggingFaceRoot, 'hub'),
+      DEEPSEEK_OCR_MODEL_CACHE_DIR: paths.modelCacheDir,
+      DEEPSEEK_OCR_GPU_TARGET: runtimeGpuTarget.id,
+      HF_HOME: paths.modelCacheDir,
+      HF_HUB_CACHE: paths.modelCacheDir,
+      TRANSFORMERS_CACHE: paths.modelCacheDir,
       PIP_CACHE_DIR: path.join(paths.pythonEnvRoot, 'pip-cache')
     };
     backendLogLabel = 'Python';
@@ -1062,7 +1065,7 @@ async function exportDiagnosticsBundle() {
       userData: app.getPath('userData'),
       pythonEnvRoot: paths.pythonEnvRoot,
       cacheRoot: paths.cacheRoot,
-      huggingFaceRoot: paths.huggingFaceRoot
+      modelCacheDir: paths.modelCacheDir
     },
     setupMarker,
     preflight,

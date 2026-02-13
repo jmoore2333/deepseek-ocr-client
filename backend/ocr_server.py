@@ -62,15 +62,70 @@ device = 'cpu'
 dtype = torch.float32
 
 
-def get_preferred_device():
-    """Select runtime device based on availability or override."""
-    if 'DEVICE' in os.environ:
-        return os.environ['DEVICE'].lower()
+def is_device_available(device_name):
+    normalized = str(device_name or '').lower()
+    if normalized == 'cuda':
+        return torch.cuda.is_available()
+    if normalized == 'mps':
+        return hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()
+    return normalized == 'cpu'
+
+
+def detect_best_available_device():
     if torch.cuda.is_available():
         return 'cuda'
     if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
         return 'mps'
     return 'cpu'
+
+
+def map_gpu_target_to_device(gpu_target):
+    normalized = str(gpu_target or '').strip().lower()
+    if normalized.startswith('cuda-'):
+        return 'cuda'
+    if normalized == 'mps':
+        return 'mps'
+    return 'cpu'
+
+
+def get_preferred_device():
+    """Select runtime device based on explicit overrides, then detected availability."""
+    if 'DEVICE' in os.environ:
+        forced_device = str(os.environ['DEVICE']).strip().lower()
+        if forced_device in ('cpu', 'cuda', 'mps'):
+            if is_device_available(forced_device):
+                return forced_device
+            fallback = detect_best_available_device()
+            logger.warning(
+                "DEVICE override %s is unavailable; falling back to %s",
+                forced_device,
+                fallback
+            )
+            return fallback
+
+        fallback = detect_best_available_device()
+        logger.warning(
+            "Unsupported DEVICE override %r; expected cpu/cuda/mps. Falling back to %s",
+            forced_device,
+            fallback
+        )
+        return fallback
+
+    gpu_target_hint = os.environ.get('DEEPSEEK_OCR_GPU_TARGET')
+    if gpu_target_hint:
+        hinted_device = map_gpu_target_to_device(gpu_target_hint)
+        if is_device_available(hinted_device):
+            return hinted_device
+        fallback = detect_best_available_device()
+        logger.warning(
+            "GPU target hint %s mapped to %s, but that device is unavailable. Falling back to %s",
+            gpu_target_hint,
+            hinted_device,
+            fallback
+        )
+        return fallback
+
+    return detect_best_available_device()
 
 
 def get_preferred_model_name():
@@ -102,7 +157,15 @@ if CACHE_DIR:
 else:
     CACHE_DIR = os.path.join(SCRIPT_DIR, '..', 'cache')
 MODEL_CACHE_DIR = os.path.join(CACHE_DIR, 'models')
+model_cache_override = os.environ.get('DEEPSEEK_OCR_MODEL_CACHE_DIR')
+if model_cache_override:
+    MODEL_CACHE_DIR = os.path.abspath(model_cache_override)
 OUTPUT_DIR = os.path.join(CACHE_DIR, 'outputs')
+
+# Keep HuggingFace internals aligned with the explicit model cache directory.
+os.environ.setdefault('HF_HOME', MODEL_CACHE_DIR)
+os.environ.setdefault('HF_HUB_CACHE', MODEL_CACHE_DIR)
+os.environ.setdefault('TRANSFORMERS_CACHE', MODEL_CACHE_DIR)
 
 # Progress tracking
 progress_data = {
@@ -426,13 +489,13 @@ def load_model_background():
             model = model.to(torch.device('cpu')).to(dtype)
             logger.info("Model loaded on CPU with float32")
 
-        # Apply torch.compile for ~30% inference speedup (PyTorch 2.0+) (95% progress)
-        update_progress('loading', 'optimize', 'Compiling model with torch.compile...', 95)
+        # Apply torch.compile on CUDA when available (95% progress).
+        update_progress('loading', 'optimize', 'Optimizing model runtime...', 95)
         try:
             if hasattr(torch, 'compile') and device == 'cuda':
                 logger.info("Applying torch.compile for faster inference...")
                 model = torch.compile(model, mode="reduce-overhead")
-                logger.info("Model compiled successfully (expect ~30% speedup)")
+                logger.info("Model compiled successfully for CUDA")
             else:
                 logger.info("torch.compile unavailable or unsupported for current device, skipping compilation")
         except Exception as e:
@@ -991,6 +1054,8 @@ def collect_runtime_diagnostics():
     with progress_lock:
         progress_snapshot = progress_data.copy()
 
+    preferred_device = get_preferred_device()
+    gpu_target_hint = os.environ.get('DEEPSEEK_OCR_GPU_TARGET')
     model_cache_bytes = get_cache_dir_size(MODEL_CACHE_DIR)
     output_cache_bytes = get_cache_dir_size(OUTPUT_DIR)
     total_cache_bytes = get_cache_dir_size(CACHE_DIR)
@@ -1007,8 +1072,11 @@ def collect_runtime_diagnostics():
             'model_name': MODEL_NAME,
             'loaded': is_model_ready(),
             'initialized': model is not None and tokenizer is not None,
+            'preferred_device': preferred_device,
             'device': device,
-            'dtype': str(dtype)
+            'dtype': str(dtype),
+            'gpu_target_hint': gpu_target_hint,
+            'gpu_target_device_hint': map_gpu_target_to_device(gpu_target_hint) if gpu_target_hint else None
         },
         'cache': {
             'cache_dir': CACHE_DIR,
@@ -1029,6 +1097,7 @@ def collect_runtime_diagnostics():
 @app.route('/health', methods=['GET'])
 def health_check():
     """Health check endpoint"""
+    gpu_target_hint = os.environ.get('DEEPSEEK_OCR_GPU_TARGET')
     preferred_device = get_preferred_device()
     model_ready = is_model_ready()
     return jsonify({
@@ -1038,6 +1107,8 @@ def health_check():
         'loading_in_progress': is_loading_in_progress(),
         'gpu_available': device in ('cuda', 'mps'),
         'preferred_gpu_available': preferred_device in ('cuda', 'mps'),
+        'gpu_target_hint': gpu_target_hint,
+        'gpu_target_device_hint': map_gpu_target_to_device(gpu_target_hint) if gpu_target_hint else None,
         'preferred_device': preferred_device,
         'device_state': device
     })
@@ -1297,12 +1368,16 @@ def perform_ocr():
 @app.route('/model_info', methods=['GET'])
 def model_info():
     """Get information about the model"""
+    gpu_target_hint = os.environ.get('DEEPSEEK_OCR_GPU_TARGET')
     return jsonify({
         'model_name': MODEL_NAME,
         'cache_dir': MODEL_CACHE_DIR,
         'model_loaded': is_model_ready(),
         'model_initialized': model is not None and tokenizer is not None,
         'gpu_available': device in ('cuda', 'mps'),
+        'gpu_target_hint': gpu_target_hint,
+        'gpu_target_device_hint': map_gpu_target_to_device(gpu_target_hint) if gpu_target_hint else None,
+        'preferred_device': get_preferred_device(),
         'device_state': device,
         'gpu_name': torch.cuda.get_device_name(0) if (device == 'cuda' and torch.cuda.is_available()) else None
     })
