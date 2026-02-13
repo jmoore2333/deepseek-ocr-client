@@ -51,8 +51,9 @@ SUPPORTED_EXTENSIONS = {
 
 mcp = FastMCP(
     "deepseek-ocr",
-    version="1.0.0",
-    description="Full control of the DeepSeek OCR desktop application",
+    instructions="Full control of the DeepSeek OCR desktop application. "
+    "Provides tools for OCR processing, queue management, model loading, "
+    "diagnostics, and retention policy management.",
 )
 
 # ---------------------------------------------------------------------------

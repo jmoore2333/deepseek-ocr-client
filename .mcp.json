@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "deepseek-ocr": {
+      "command": "venv/bin/python3",
+      "args": ["backend/mcp_server.py"],
+      "env": {
+        "DEEPSEEK_OCR_URL": "http://127.0.0.1:5000"
+      }
+    }
+  }
+}

@@ -30,34 +30,40 @@ The MCP server is a Python process that communicates with the Flask backend over
 
 ## Installation
 
-### Option A: Claude Code Plugin (Recommended)
+### Option A: Project-Level `.mcp.json` (Recommended)
 
-The plugin is bundled in the `mcp-plugin/` directory of this repository.
+The project includes a `.mcp.json` at the root that Claude Code auto-discovers when you open the project directory. No manual installation needed.
+
+First, set up the Python environment:
 
 ```bash
-# From the project root, install as a local plugin
-claude plugin install --path ./mcp-plugin
+# Create a venv and install MCP dependencies
+uv venv venv --python 3.11
+uv pip install --python venv/bin/python3 "mcp[cli]>=1.0.0" "httpx>=0.27.0"
 ```
 
-This registers the MCP server and adds three skills:
+The `.mcp.json` points to `venv/bin/python3` so the MCP server uses this venv. When you start a new Claude Code session in this project, the MCP server will be available automatically.
+
+### Option B: CLI Registration
+
+```bash
+claude mcp add --transport stdio --scope project deepseek-ocr -- venv/bin/python3 backend/mcp_server.py
+```
+
+### Option C: Plugin with Skills
+
+The `mcp-plugin/` directory contains a Claude Code plugin with three workflow skills. To test locally:
+
+```bash
+claude --plugin-dir ./mcp-plugin
+```
+
+Skills provided:
 - `/deepseek-ocr:ocr-single-file` — Process a single image or PDF
 - `/deepseek-ocr:ocr-batch-folder` — Batch process a folder of files
 - `/deepseek-ocr:system-check` — Full system diagnostic
 
-### Option B: Project-Level MCP Config
-
-If you prefer not to install the plugin globally, the project already includes a `.claude/mcp_servers.json` that configures the MCP server for this project:
-
-```json
-{
-  "deepseek-ocr": {
-    "command": "python",
-    "args": ["backend/mcp_server.py"],
-    "env": {
-      "DEEPSEEK_OCR_URL": "http://127.0.0.1:5000"
-    }
-  }
-}
+### Option D: Manual MCP Configuration
 ```
 
 This activates automatically when you open Claude Code in the project directory.
