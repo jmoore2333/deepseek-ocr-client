@@ -7,55 +7,102 @@
     <title>DeepSeek-OCR Client</title>
     <link rel="stylesheet" href="styles.css">
 </head>
-<body>
-    <div class="container">
-        <header>
-            <div class="header-top">
-                <div class="header-left">
-                    <h1>DeepSeek-OCR Client</h1>
-                    <p class="disclaimer">Unaffiliated with DeepSeek</p>
-                    <div class="status-bar">
-                        <div class="status-item">
-                            <span class="status-label">Server:</span>
-                            <span id="server-status" class="status-value">Connecting...</span>
-                        </div>
-                        <div class="status-item">
-                            <span class="status-label">Model:</span>
-                            <span id="model-status" class="status-value">Not loaded</span>
-                        </div>
-                        <div class="status-item">
-                            <span class="status-label">GPU:</span>
-                            <span id="gpu-status" class="status-value">Unknown</span>
-                        </div>
+<body data-ui-mode="advanced">
+    <div class="app-shell">
+        <header class="status-rail">
+            <div class="brand-cluster">
+                <p class="brand-kicker">Operator Desk</p>
+                <h1>DeepSeek-OCR Client</h1>
+                <p class="disclaimer">Unaffiliated with DeepSeek</p>
+            </div>
+
+            <div class="status-cluster">
+                <div class="status-bar">
+                    <div class="status-item">
+                        <span class="status-label">Server</span>
+                        <span id="server-status" class="status-value">Connecting...</span>
                     </div>
-                    <div id="startup-panel" class="startup-panel" data-state="running" style="display: none;">
-                        <div class="startup-head">
-                            <span id="startup-phase" class="startup-phase">Starting</span>
-                            <span id="startup-percent" class="startup-percent">0%</span>
-                        </div>
-                        <div id="startup-message" class="startup-message">Preparing application...</div>
-                        <div class="startup-progress-track">
-                            <div id="startup-progress-bar" class="startup-progress-bar"></div>
-                        </div>
+                    <div class="status-item">
+                        <span class="status-label">Model</span>
+                        <span id="model-status" class="status-value">Not loaded</span>
                     </div>
-                    <div class="header-links">
-                        <a href="https://huggingface.co/deepseek-ai/DeepSeek-OCR" target="_blank">Model HuggingFace</a>
-                        <span class="link-divider">•</span>
-                        <a href="https://deepseek.ai/blog/deepseek-ocr-context-compression" target="_blank">Model Blog Post</a>
-                        <span class="link-divider">•</span>
-                        <a href="https://github.com/deepseek-ai/DeepSeek-OCR" target="_blank">Model GitHub</a>
-                        <span class="link-divider">•</span>
-                        <a href="https://github.com/jmoore2333/deepseek-ocr-client/" target="_blank">Client GitHub</a>
+                    <div class="status-item">
+                        <span class="status-label">GPU</span>
+                        <span id="gpu-status" class="status-value">Unknown</span>
                     </div>
                 </div>
 
-                <div class="header-divider"></div>
+                <div class="utility-row">
+                    <div class="mode-toggle">
+                        <button id="ui-mode-basic-btn" class="btn btn-small btn-mode">Basic</button>
+                        <button id="ui-mode-advanced-btn" class="btn btn-small btn-mode active">Advanced</button>
+                    </div>
+                    <div class="utility-buttons">
+                        <button id="preflight-btn" class="btn btn-small">Run Preflight</button>
+                        <button id="diagnostics-btn" class="btn btn-small">Export Diagnostics</button>
+                    </div>
+                </div>
 
-                <div class="header-right">
+                <div class="header-links">
+                    <a href="https://huggingface.co/deepseek-ai/DeepSeek-OCR" target="_blank">Model HuggingFace</a>
+                    <span class="link-divider">•</span>
+                    <a href="https://deepseek.ai/blog/deepseek-ocr-context-compression" target="_blank">Model Blog</a>
+                    <span class="link-divider">•</span>
+                    <a href="https://github.com/deepseek-ai/DeepSeek-OCR" target="_blank">Model GitHub</a>
+                    <span class="link-divider">•</span>
+                    <a href="https://github.com/jmoore2333/deepseek-ocr-client/" target="_blank">Client GitHub</a>
+                </div>
+            </div>
+        </header>
+
+        <div class="meta-row">
+            <div id="startup-panel" class="startup-panel" data-state="running" style="display: none;">
+                <div class="startup-head">
+                    <span id="startup-phase" class="startup-phase">Starting</span>
+                    <span id="startup-percent" class="startup-percent">0%</span>
+                </div>
+                <div id="startup-message" class="startup-message">Preparing application...</div>
+                <div class="startup-progress-track">
+                    <div id="startup-progress-bar" class="startup-progress-bar"></div>
+                </div>
+            </div>
+
+            <div id="preflight-panel" class="info-panel" style="display: none;">
+                <div class="info-panel-header">
+                    <span class="info-panel-title">Preflight</span>
+                    <span id="preflight-summary" class="info-panel-summary"></span>
+                </div>
+                <div id="preflight-details" class="info-panel-details"></div>
+            </div>
+        </div>
+
+        <main class="workspace">
+            <aside class="control-rail">
+                <section class="panel control-panel">
+                    <div class="panel-head">
+                        <h2>Input and Settings</h2>
+                    </div>
+
+                    <div class="upload-section">
+                        <div id="drop-zone" class="drop-zone">
+                            <svg class="upload-icon" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
+                            </svg>
+                            <p class="upload-text">Drop image or PDF</p>
+                            <button id="select-btn" class="btn btn-primary btn-compact">Select File</button>
+                        </div>
+
+                        <div id="preview-section" class="preview-section" style="display: none;">
+                            <img id="image-preview" alt="Preview" class="preview-image-clickable">
+                            <p id="selected-file-label" class="selected-file-label"></p>
+                            <button id="clear-btn" class="btn btn-secondary btn-compact">Clear</button>
+                        </div>
+                    </div>
+
                     <div class="controls-section">
                         <div class="controls-grid">
                             <div class="form-group">
-                                <label for="prompt-type">Type:</label>
+                                <label for="prompt-type">Type</label>
                                 <select id="prompt-type">
                                     <option value="document">Document</option>
                                     <option value="ocr">Other image</option>
@@ -65,8 +112,8 @@
                                 </select>
                             </div>
 
-                            <div class="form-group">
-                                <label for="base-size">Base:</label>
+                            <div class="form-group advanced-only">
+                                <label for="base-size">Base</label>
                                 <select id="base-size">
                                     <option value="512">512</option>
                                     <option value="640">640</option>
@@ -75,8 +122,8 @@
                                 </select>
                             </div>
 
-                            <div class="form-group">
-                                <label for="image-size">Size:</label>
+                            <div class="form-group advanced-only">
+                                <label for="image-size">Size</label>
                                 <select id="image-size">
                                     <option value="512">512</option>
                                     <option value="640" selected>640</option>
@@ -85,88 +132,118 @@
                                 </select>
                             </div>
 
-                            <div class="form-group">
+                            <div class="form-group advanced-only form-group-inline">
                                 <label>
                                     <input type="checkbox" id="crop-mode" checked>
                                     Crop
                                 </label>
                             </div>
+
+                            <div class="form-group advanced-only form-group-wide">
+                                <label for="pdf-page-range">PDF Pages</label>
+                                <input id="pdf-page-range" type="text" placeholder="All pages or 1-3,5">
+                            </div>
                         </div>
 
                         <div class="controls-buttons">
+                            <button id="load-model-btn" class="btn btn-secondary">Load Model</button>
                             <button id="ocr-btn" class="btn btn-primary" disabled>
                                 <span id="ocr-btn-text">Run OCR</span>
                             </button>
-                            <button id="load-model-btn" class="btn btn-secondary">
-                                Load Model
-                            </button>
+                        </div>
+                    </div>
+                </section>
+
+                <section class="panel queue-panel" id="queue-panel">
+                    <div class="queue-header">
+                        <h3>Queue <span class="queue-count">(<span id="queue-count">0</span>)</span></h3>
+                        <div class="queue-buttons">
+                            <button id="add-files-btn" class="btn btn-small">Add Files</button>
+                            <button id="add-folder-btn" class="btn btn-small">Add Folder</button>
+                            <button id="process-queue-btn" class="btn btn-primary btn-small" disabled>Process Queue</button>
+                            <button id="pause-queue-btn" class="btn btn-small" disabled>Pause</button>
+                            <button id="resume-queue-btn" class="btn btn-small" style="display: none;" disabled>Resume</button>
+                            <button id="cancel-queue-btn" class="btn btn-small" disabled>Cancel</button>
+                            <button id="retry-failed-btn" class="btn btn-small" disabled>Retry Failed</button>
+                            <button id="clear-queue-btn" class="btn btn-small" disabled>Clear Queue</button>
+                            <button id="open-output-btn" class="btn btn-small" style="display: none;">Open Output Folder</button>
                         </div>
                     </div>
 
-                    <div class="header-divider"></div>
+                    <div id="queue-list" class="queue-list">
+                        <p class="queue-empty">Queue is empty. Add files to begin.</p>
+                    </div>
 
-                    <div class="upload-section">
-                        <div id="drop-zone" class="drop-zone">
-                            <svg class="upload-icon" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
-                            </svg>
-                            <p class="upload-text">Drop image/PDF or click</p>
-                            <button id="select-btn" class="btn btn-primary btn-compact">Select</button>
-                        </div>
-
-                        <div id="preview-section" class="preview-section" style="display: none;">
-                            <img id="image-preview" alt="Preview" class="preview-image-clickable">
-                            <p id="selected-file-label" class="selected-file-label"></p>
-                            <button id="clear-btn" class="btn btn-secondary btn-compact">Clear</button>
+                    <div class="queue-progress">
+                        <div class="progress-text">Overall <span id="queue-progress-text">0/0</span></div>
+                        <div class="progress-bar-container">
+                            <div id="queue-progress-bar" class="progress-bar" style="width: 0%;"></div>
                         </div>
                     </div>
-                </div>
-            </div>
-        </header>
 
-        <main>
-            <!-- Queue Panel -->
-            <div class="queue-panel" id="queue-panel">
-                <div class="queue-header">
-                    <h3>Processing Queue (<span id="queue-count">0</span>)</h3>
-                    <div class="queue-buttons">
-                        <button id="add-files-btn" class="btn btn-small">Add Files</button>
-                        <button id="add-folder-btn" class="btn btn-small">Add Folder</button>
-                        <button id="process-queue-btn" class="btn btn-primary btn-small" disabled>Process Queue</button>
-                        <button id="clear-queue-btn" class="btn btn-small" disabled>Clear Queue</button>
-                        <button id="open-output-btn" class="btn btn-small" style="display: none;">Open Output Folder</button>
+                    <div id="retention-panel" class="retention-panel advanced-only">
+                        <div class="retention-title">Cache and Output Retention</div>
+                        <div class="retention-grid">
+                            <div class="retention-item">
+                                <label for="retention-output-days">Output days</label>
+                                <input id="retention-output-days" type="number" min="0" max="3650" value="30">
+                            </div>
+                            <div class="retention-item">
+                                <label for="retention-max-runs">Max queue runs</label>
+                                <input id="retention-max-runs" type="number" min="1" max="1000" value="40">
+                            </div>
+                            <div class="retention-item">
+                                <label for="retention-cache-days">Download cache days</label>
+                                <input id="retention-cache-days" type="number" min="0" max="3650" value="30">
+                            </div>
+                            <div class="retention-item retention-checkbox">
+                                <label>
+                                    <input id="retention-cleanup-startup" type="checkbox" checked>
+                                    Cleanup on startup
+                                </label>
+                            </div>
+                        </div>
+                        <div class="retention-actions">
+                            <button id="save-retention-btn" class="btn btn-small">Save Policy</button>
+                            <button id="run-cleanup-btn" class="btn btn-small">Run Cleanup</button>
+                            <span id="retention-status" class="retention-status"></span>
+                        </div>
                     </div>
-                </div>
-                <div id="queue-list" class="queue-list">
-                    <p class="queue-empty">Queue is empty. Add files to begin.</p>
-                </div>
-                <div class="queue-progress">
-                    <div class="progress-text">
-                        <span>Overall: <span id="queue-progress-text">0/0</span></span>
-                    </div>
-                    <div class="progress-bar-container">
-                        <div id="queue-progress-bar" class="progress-bar" style="width: 0%;"></div>
-                    </div>
-                </div>
-            </div>
+                </section>
+            </aside>
 
-            <div class="results-panel">
+            <section class="panel stage-panel">
+                <div class="panel-head">
+                    <h2>Preview Stage</h2>
+                    <p class="panel-subtitle">Live image preview with detection overlays</p>
+                </div>
+                <div class="ocr-preview-wrapper">
+                    <div id="ocr-preview-container" class="ocr-preview-container">
+                        <img id="ocr-preview-image" class="ocr-preview-image" alt="OCR Preview">
+                        <svg id="ocr-boxes-overlay" class="ocr-boxes-overlay"></svg>
+                    </div>
+                </div>
+            </section>
+
+            <section class="panel output-panel results-panel">
                 <div class="results-section">
                     <div class="results-header">
                         <div class="results-title-row">
-                            <h3>OCR Results</h3>
+                            <h3>Output Inspector</h3>
                             <div id="progress-inline" class="progress-inline" style="display: none;">
                                 <div class="spinner-small"></div>
                                 <span id="progress-status" class="progress-status"></span>
                             </div>
                         </div>
                         <div class="results-buttons">
-                            <button id="view-boxes-btn" class="btn btn-small" style="display: none;">View Boxes Image</button>
-                            <button id="view-tokens-btn" class="btn btn-small" style="display: none;">View Raw Tokens</button>
+                            <button id="view-boxes-btn" class="btn btn-small advanced-only" style="display: none;">View Boxes Image</button>
+                            <button id="view-tokens-btn" class="btn btn-small advanced-only" style="display: none;">View Raw Tokens</button>
                             <button id="copy-btn" class="btn btn-small" style="display: none;">Copy to Clipboard</button>
                             <button id="download-zip-btn" class="btn btn-small" style="display: none;">Download ZIP</button>
                         </div>
                     </div>
+
+                    <div id="message-banner" class="message-banner" hidden></div>
 
                     <div id="model-progress" class="loading-indicator" style="display: none;">
                         <div class="spinner"></div>
@@ -178,30 +255,17 @@
                         <p id="progress-percent" class="loading-subtext">0%</p>
                     </div>
 
-                    <div class="results-panels">
-                        <div class="results-panel-left">
-                            <div id="results-content" class="results-content"></div>
-                        </div>
-
-                        <div class="results-panel-right">
-                            <div class="ocr-preview-wrapper">
-                                <div id="ocr-preview-container" class="ocr-preview-container">
-                                    <img id="ocr-preview-image" class="ocr-preview-image">
-                                    <svg id="ocr-boxes-overlay" class="ocr-boxes-overlay"></svg>
-                                </div>
-                            </div>
-                        </div>
+                    <div id="results-content" class="results-content">
+                        <p class="placeholder-text">OCR results will appear here.</p>
                     </div>
                 </div>
-            </div>
-        </div>
+            </section>
         </main>
     </div>
 
-    <!-- Lightbox -->
     <div id="lightbox" class="lightbox" style="display: none;">
         <div class="lightbox-content">
-            <span class="lightbox-close">&times;</span>
+            <span class="lightbox-close" role="button" tabindex="0">&times;</span>
             <img id="lightbox-image" alt="Full size image">
             <pre id="lightbox-text" style="display: none;"></pre>
         </div>

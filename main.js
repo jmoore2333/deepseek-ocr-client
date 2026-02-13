@@ -5,6 +5,7 @@ const fs = require('fs');
 const os = require('os');
 const crypto = require('crypto');
 const axios = require('axios');
+const JSZip = require('jszip');
 
 let mainWindow;
 let pythonProcess;
@@ -21,6 +22,69 @@ const INPUT_MIME_TYPES = {
   '.webp': 'image/webp',
   '.pdf': 'application/pdf'
 };
+const RETENTION_POLICY_FILE = 'retention-policy.json';
+const DEFAULT_RETENTION_POLICY = {
+  outputRetentionDays: 30,
+  maxQueueRuns: 40,
+  downloadCacheRetentionDays: 30,
+  cleanupOnStartup: true
+};
+const PREFLIGHT_ESTIMATES = {
+  pythonRuntimeBytes: 1600 * 1024 * 1024,
+  dependencyBytes: 1800 * 1024 * 1024,
+  modelBytes: 7800 * 1024 * 1024,
+  scratchBytes: 2200 * 1024 * 1024
+};
+
+const MAIN_LOG_BUFFER_MAX = 1800;
+const mainLogBuffer = [];
+
+function formatLocalTimestamp(date = new Date()) {
+  const pad = (value, size = 2) => String(value).padStart(size, '0');
+  const year = date.getFullYear();
+  const month = pad(date.getMonth() + 1);
+  const day = pad(date.getDate());
+  const hours = pad(date.getHours());
+  const minutes = pad(date.getMinutes());
+  const seconds = pad(date.getSeconds());
+  const milliseconds = pad(date.getMilliseconds(), 3);
+  const offsetMinutes = -date.getTimezoneOffset();
+  const sign = offsetMinutes >= 0 ? '+' : '-';
+  const absOffset = Math.abs(offsetMinutes);
+  const offsetHours = pad(Math.floor(absOffset / 60));
+  const offsetRemainder = pad(absOffset % 60);
+  return `${year}-${month}-${day}T${hours}:${minutes}:${seconds}.${milliseconds}${sign}${offsetHours}:${offsetRemainder}`;
+}
+
+function getLocalTimezone() {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || 'local';
+  } catch (error) {
+    return 'local';
+  }
+}
+
+function getZipEntryLocalDate() {
+  const now = new Date();
+  return new Date(now.getTime() - (now.getTimezoneOffset() * 60 * 1000));
+}
+
+function appendMainLog(level, source, message) {
+  const entry = {
+    timestamp: formatLocalTimestamp(),
+    level,
+    source,
+    message: String(message)
+  };
+  mainLogBuffer.push(entry);
+  if (mainLogBuffer.length > MAIN_LOG_BUFFER_MAX) {
+    mainLogBuffer.splice(0, mainLogBuffer.length - MAIN_LOG_BUFFER_MAX);
+  }
+}
+
+function getMainLogTail(limit = 300) {
+  return mainLogBuffer.slice(Math.max(0, mainLogBuffer.length - limit));
+}
 let startupStatus = {
   phase: 'booting',
   message: 'Starting application...',
@@ -44,6 +108,7 @@ function setStartupStatus(phase, message, progress, state = 'running') {
     updatedAt: Date.now()
   };
   console.log(`[startup] ${phase} ${progress}% ${message}`);
+  appendMainLog('info', 'startup', `${phase} ${progress}% ${message}`);
   emitStartupStatus();
 }
 
@@ -104,6 +169,247 @@ function readJsonFile(filePath) {
 function writeJsonFile(filePath, value) {
   ensureDirectory(path.dirname(filePath));
   fs.writeFileSync(filePath, JSON.stringify(value, null, 2), 'utf-8');
+}
+
+function safeNumber(value, fallback, min = Number.MIN_SAFE_INTEGER, max = Number.MAX_SAFE_INTEGER) {
+  const numeric = Number.parseInt(value, 10);
+  if (!Number.isFinite(numeric)) {
+    return fallback;
+  }
+  return Math.max(min, Math.min(max, numeric));
+}
+
+function getDirectorySize(dirPath) {
+  let total = 0;
+  if (!fs.existsSync(dirPath)) {
+    return total;
+  }
+  const stack = [dirPath];
+  while (stack.length > 0) {
+    const current = stack.pop();
+    let entries = [];
+    try {
+      entries = fs.readdirSync(current, { withFileTypes: true });
+    } catch (error) {
+      continue;
+    }
+    for (const entry of entries) {
+      const fullPath = path.join(current, entry.name);
+      try {
+        if (entry.isDirectory()) {
+          stack.push(fullPath);
+        } else if (entry.isFile()) {
+          total += fs.statSync(fullPath).size;
+        }
+      } catch (error) {
+        // Best effort: ignore transient files.
+      }
+    }
+  }
+  return total;
+}
+
+function statDiskFreeBytes(targetPath) {
+  try {
+    const statfs = fs.statfsSync(targetPath);
+    return Number(statfs.bavail) * Number(statfs.bsize);
+  } catch (error) {
+    return null;
+  }
+}
+
+function getRetentionPolicyPath() {
+  return path.join(app.getPath('userData'), RETENTION_POLICY_FILE);
+}
+
+function normalizeRetentionPolicy(input = {}) {
+  return {
+    outputRetentionDays: safeNumber(input.outputRetentionDays, DEFAULT_RETENTION_POLICY.outputRetentionDays, 0, 3650),
+    maxQueueRuns: safeNumber(input.maxQueueRuns, DEFAULT_RETENTION_POLICY.maxQueueRuns, 1, 1000),
+    downloadCacheRetentionDays: safeNumber(
+      input.downloadCacheRetentionDays,
+      DEFAULT_RETENTION_POLICY.downloadCacheRetentionDays,
+      0,
+      3650
+    ),
+    cleanupOnStartup: input.cleanupOnStartup !== undefined
+      ? Boolean(input.cleanupOnStartup)
+      : DEFAULT_RETENTION_POLICY.cleanupOnStartup
+  };
+}
+
+function loadRetentionPolicy() {
+  const existing = readJsonFile(getRetentionPolicyPath());
+  if (!existing) {
+    return { ...DEFAULT_RETENTION_POLICY };
+  }
+  return normalizeRetentionPolicy(existing);
+}
+
+function saveRetentionPolicy(policy) {
+  const normalized = normalizeRetentionPolicy(policy);
+  writeJsonFile(getRetentionPolicyPath(), normalized);
+  return normalized;
+}
+
+function cleanupFilesOlderThan(rootPath, cutoffMs) {
+  let removedFiles = 0;
+  let removedBytes = 0;
+  if (!fs.existsSync(rootPath)) {
+    return { removedFiles, removedBytes };
+  }
+
+  const walk = (dirPath) => {
+    let entries = [];
+    try {
+      entries = fs.readdirSync(dirPath, { withFileTypes: true });
+    } catch (error) {
+      return;
+    }
+
+    for (const entry of entries) {
+      const fullPath = path.join(dirPath, entry.name);
+      if (entry.isDirectory()) {
+        walk(fullPath);
+        try {
+          const remaining = fs.readdirSync(fullPath);
+          if (remaining.length === 0) {
+            fs.rmdirSync(fullPath);
+          }
+        } catch (error) {
+          // Ignore non-empty or inaccessible directories.
+        }
+      } else if (entry.isFile()) {
+        try {
+          const stat = fs.statSync(fullPath);
+          if (stat.mtimeMs < cutoffMs) {
+            removedBytes += stat.size;
+            removedFiles += 1;
+            fs.rmSync(fullPath, { force: true });
+          }
+        } catch (error) {
+          // Ignore files that disappear during cleanup.
+        }
+      }
+    }
+  };
+
+  walk(rootPath);
+  return { removedFiles, removedBytes };
+}
+
+function applyRetentionPolicy(paths, policyInput) {
+  const policy = normalizeRetentionPolicy(policyInput || loadRetentionPolicy());
+  const nowMs = Date.now();
+  const report = {
+    policy,
+    removedQueueRuns: 0,
+    removedQueueBytes: 0,
+    removedCacheFiles: 0,
+    removedCacheBytes: 0,
+    scannedAt: formatLocalTimestamp()
+  };
+
+  const outputsRoot = path.join(paths.cacheRoot, 'outputs');
+  if (fs.existsSync(outputsRoot)) {
+    let queueDirs = [];
+    try {
+      queueDirs = fs.readdirSync(outputsRoot, { withFileTypes: true })
+        .filter((entry) => entry.isDirectory() && entry.name.startsWith('queue_'))
+        .map((entry) => {
+          const fullPath = path.join(outputsRoot, entry.name);
+          const stat = fs.statSync(fullPath);
+          return { name: entry.name, fullPath, mtimeMs: stat.mtimeMs };
+        });
+    } catch (error) {
+      queueDirs = [];
+    }
+
+    if (policy.outputRetentionDays > 0) {
+      const cutoffMs = nowMs - (policy.outputRetentionDays * 24 * 60 * 60 * 1000);
+      for (const dir of queueDirs.filter((entry) => entry.mtimeMs < cutoffMs)) {
+        const removedSize = getDirectorySize(dir.fullPath);
+        fs.rmSync(dir.fullPath, { recursive: true, force: true });
+        report.removedQueueRuns += 1;
+        report.removedQueueBytes += removedSize;
+      }
+    }
+
+    if (policy.maxQueueRuns > 0) {
+      let activeQueueDirs = [];
+      try {
+        activeQueueDirs = fs.readdirSync(outputsRoot, { withFileTypes: true })
+          .filter((entry) => entry.isDirectory() && entry.name.startsWith('queue_'))
+          .map((entry) => {
+            const fullPath = path.join(outputsRoot, entry.name);
+            const stat = fs.statSync(fullPath);
+            return { name: entry.name, fullPath, mtimeMs: stat.mtimeMs };
+          })
+          .sort((a, b) => b.mtimeMs - a.mtimeMs);
+      } catch (error) {
+        activeQueueDirs = [];
+      }
+
+      const stale = activeQueueDirs.slice(policy.maxQueueRuns);
+      for (const dir of stale) {
+        const removedSize = getDirectorySize(dir.fullPath);
+        fs.rmSync(dir.fullPath, { recursive: true, force: true });
+        report.removedQueueRuns += 1;
+        report.removedQueueBytes += removedSize;
+      }
+    }
+  }
+
+  if (policy.downloadCacheRetentionDays > 0) {
+    const cutoffMs = nowMs - (policy.downloadCacheRetentionDays * 24 * 60 * 60 * 1000);
+    const uvCleanup = cleanupFilesOlderThan(paths.uvCacheDir, cutoffMs);
+    const pipCleanup = cleanupFilesOlderThan(paths.pipCacheDir, cutoffMs);
+    report.removedCacheFiles = uvCleanup.removedFiles + pipCleanup.removedFiles;
+    report.removedCacheBytes = uvCleanup.removedBytes + pipCleanup.removedBytes;
+  }
+
+  appendMainLog('info', 'retention', `Applied retention policy: ${JSON.stringify(report)}`);
+  return report;
+}
+
+function buildPreflightReport(paths) {
+  const setupMarker = readJsonFile(paths.setupMarkerPath);
+  const hasManagedEnv = Boolean(setupMarker && fs.existsSync(paths.venvPython));
+  const pythonEnvBytes = getDirectorySize(paths.pythonEnvRoot);
+  const hfCacheBytes = getDirectorySize(paths.huggingFaceRoot);
+  const modelLikelyPresent = hfCacheBytes > (800 * 1024 * 1024);
+  const freeBytes = statDiskFreeBytes(app.getPath('userData'));
+
+  const pythonSetupBytes = PREFLIGHT_ESTIMATES.pythonRuntimeBytes + PREFLIGHT_ESTIMATES.dependencyBytes;
+  const expectedDownloadBytes = (hasManagedEnv ? 0 : pythonSetupBytes) + (modelLikelyPresent ? 0 : PREFLIGHT_ESTIMATES.modelBytes);
+  const expectedRequiredBytes = expectedDownloadBytes + PREFLIGHT_ESTIMATES.scratchBytes;
+  const diskOk = freeBytes === null ? null : freeBytes >= expectedRequiredBytes;
+
+  const estimateMinutesAtMbps = (mbps) => {
+    if (expectedDownloadBytes <= 0 || mbps <= 0) {
+      return 0;
+    }
+    const bits = expectedDownloadBytes * 8;
+    const seconds = bits / (mbps * 1_000_000);
+    return Math.round(seconds / 60);
+  };
+
+  return {
+    checkedAt: formatLocalTimestamp(),
+    setupComplete: hasManagedEnv,
+    modelCachePresent: modelLikelyPresent,
+    pythonEnvBytes,
+    huggingFaceBytes: hfCacheBytes,
+    expectedDownloadBytes,
+    expectedRequiredBytes,
+    freeDiskBytes: freeBytes,
+    diskOk,
+    estimatedMinutes: {
+      fast_100mbps: estimateMinutesAtMbps(100),
+      typical_30mbps: estimateMinutesAtMbps(30),
+      slow_10mbps: estimateMinutesAtMbps(10)
+    }
+  };
 }
 
 function sha256File(filePath) {
@@ -184,10 +490,16 @@ function runCommand(command, args, options = {}) {
         for (const line of text.split(/\r?\n/)) {
           if (line) {
             console.log(`${logPrefix}${line}`);
+            appendMainLog('info', 'setup', `${logPrefix}${line}`);
           }
         }
       } else {
         process.stdout.write(text);
+        for (const line of text.split(/\r?\n/)) {
+          if (line) {
+            appendMainLog('info', 'process', line);
+          }
+        }
       }
     });
 
@@ -198,10 +510,16 @@ function runCommand(command, args, options = {}) {
         for (const line of text.split(/\r?\n/)) {
           if (line) {
             console.log(`${logPrefix}${line}`);
+            appendMainLog('warn', 'setup', `${logPrefix}${line}`);
           }
         }
       } else {
         process.stderr.write(text);
+        for (const line of text.split(/\r?\n/)) {
+          if (line) {
+            appendMainLog('warn', 'process', line);
+          }
+        }
       }
     });
 
@@ -349,32 +667,46 @@ async function setupPythonEnvironmentWithUv(paths) {
     throw new Error(`requirements.txt not found: ${paths.requirementsFile}`);
   }
 
+  const gpuTarget = detectGpuTarget();
+  console.log(`[setup] Detected hardware target: ${gpuTarget.displayName}`);
+  setStartupStatus('setup-detect-hardware', `Detected ${gpuTarget.displayName}`, 18);
+
   const uvBinary = resolveUvBinaryPath(paths);
   const requirementsHash = sha256File(paths.requirementsFile);
   const existingMarker = readJsonFile(paths.setupMarkerPath);
-
-  if (
+  const markerCoreMatch = Boolean(
     existingMarker &&
     existingMarker.app_version === app.getVersion() &&
     existingMarker.requirements_hash === requirementsHash &&
     fs.existsSync(paths.venvPython)
-  ) {
-    console.log('[setup] Existing Python environment is valid');
-    setStartupStatus('setup-ready', 'Using existing Python environment', 35);
+  );
+  const markerTargetMatch = markerCoreMatch && existingMarker.gpu_target === gpuTarget.id;
+
+  if (markerTargetMatch) {
+    console.log(`[setup] Existing Python environment is valid for ${gpuTarget.displayName}`);
+    setStartupStatus('setup-ready', `Using existing ${gpuTarget.displayName} environment`, 35);
     return paths.venvPython;
   }
 
-  console.log('[setup] Initializing Python environment with bundled uv');
-  setStartupStatus('setup-init', 'Initializing first-run Python setup...', 20);
+  if (markerCoreMatch) {
+    const previousTarget = existingMarker.gpu_display || existingMarker.gpu_target || 'unknown target';
+    console.log(`[setup] Hardware target changed (${previousTarget} -> ${gpuTarget.displayName}), refreshing runtime`);
+    setStartupStatus(
+      'setup-hardware-change',
+      `Hardware changed (${previousTarget} -> ${gpuTarget.displayName}), refreshing runtime...`,
+      22
+    );
+  } else {
+    console.log('[setup] Initializing Python environment with bundled uv');
+    setStartupStatus('setup-init', 'Initializing first-run Python setup...', 20);
+  }
+
   ensureDirectory(paths.pythonEnvRoot);
   ensureDirectory(paths.pythonInstallDir);
   ensureDirectory(paths.uvCacheDir);
   ensureDirectory(paths.pipCacheDir);
 
   const setupEnv = getUvSetupEnv(paths);
-  const gpuTarget = detectGpuTarget();
-  console.log(`[setup] Detected hardware target: ${gpuTarget.displayName}`);
-  setStartupStatus('setup-detect-hardware', `Detected ${gpuTarget.displayName}`, 25);
 
   if (fs.existsSync(paths.venvDir)) {
     fs.rmSync(paths.venvDir, { recursive: true, force: true });
@@ -425,7 +757,7 @@ async function setupPythonEnvironmentWithUv(paths) {
     gpu_display: gpuTarget.displayName,
     uv_version: uvVersion,
     python_executable: paths.venvPython,
-    updated_at: new Date().toISOString()
+    updated_at: formatLocalTimestamp()
   });
   console.log('[setup] Python environment setup complete');
   setStartupStatus('setup-complete', 'Python environment ready', 95);
@@ -438,8 +770,10 @@ function createWindow() {
     width: 1200,
     height: 800,
     webPreferences: {
-      nodeIntegration: true,
-      contextIsolation: false
+      preload: path.join(__dirname, 'preload.js'),
+      nodeIntegration: false,
+      contextIsolation: true,
+      sandbox: false
     },
     icon: path.join(__dirname, 'assets', 'icon.png')
   });
@@ -481,6 +815,17 @@ async function startPythonServer() {
   setStartupStatus('backend-init', 'Preparing backend startup...', 5);
   const paths = getAppPaths();
   const useMockBackend = process.env.DEEPSEEK_MOCK_BACKEND === '1';
+
+  try {
+    const retentionPolicy = loadRetentionPolicy();
+    if (retentionPolicy.cleanupOnStartup) {
+      setStartupStatus('cleanup', 'Applying cache retention policy...', 8);
+      const cleanupReport = applyRetentionPolicy(paths, retentionPolicy);
+      console.log(`[cleanup] Removed ${cleanupReport.removedQueueRuns} queue runs`);
+    }
+  } catch (error) {
+    appendMainLog('warn', 'retention', `Retention cleanup failed: ${error.message}`);
+  }
 
   let backendCommand;
   let backendArgs = [];
@@ -562,31 +907,45 @@ async function startPythonServer() {
     };
 
     pythonProcess.stdout.on('data', (data) => {
-      console.log(`${backendLogLabel}: ${data.toString()}`);
+      const text = data.toString();
+      console.log(`${backendLogLabel}: ${text}`);
+      for (const line of text.split(/\r?\n/)) {
+        if (line) {
+          appendMainLog('info', backendLogLabel, line);
+        }
+      }
 
       // Check if server is ready
-      if (data.toString().includes('Running on')) {
+      if (text.includes('Running on')) {
         markAsReady();
       }
     });
 
     pythonProcess.stderr.on('data', (data) => {
+      const text = data.toString();
       // Flask logs to stderr by default, even for INFO messages
-      console.log(`${backendLogLabel}: ${data.toString()}`);
+      console.log(`${backendLogLabel}: ${text}`);
+      for (const line of text.split(/\r?\n/)) {
+        if (line) {
+          appendMainLog('warn', backendLogLabel, line);
+        }
+      }
 
       // Flask logs to stderr, so also check here for server ready message
-      if (data.toString().includes('Running on')) {
+      if (text.includes('Running on')) {
         markAsReady();
       }
     });
 
     pythonProcess.on('close', (code) => {
       console.log(`Python process exited with code ${code}`);
+      appendMainLog('warn', 'backend', `Backend process exited with code ${code}`);
     });
 
     pythonProcess.on('error', (error) => {
       if (!resolved) {
         resolved = true;
+        appendMainLog('error', 'backend', `Backend process error: ${error.message}`);
         setStartupStatus('error', `Backend process failed: ${error.message}`, 100, 'error');
         reject(new Error(`Failed to start Python backend process: ${error.message}`));
       }
@@ -636,9 +995,123 @@ async function checkServerHealth() {
 function stopPythonServer() {
   if (pythonProcess) {
     console.log('Stopping Python server...');
+    appendMainLog('info', 'backend', 'Stopping backend process');
     pythonProcess.kill();
     pythonProcess = null;
   }
+}
+
+function parseMarkdownImageNames(markdownText) {
+  const imageRegex = /!\[[^\]]*\]\(images\/([^)]+)\)/g;
+  const imageNames = new Set();
+  let match = imageRegex.exec(markdownText || '');
+  while (match) {
+    const safeName = path.basename(match[1]);
+    if (safeName) {
+      imageNames.add(safeName);
+    }
+    match = imageRegex.exec(markdownText || '');
+  }
+  return Array.from(imageNames);
+}
+
+async function exportDiagnosticsBundle() {
+  const paths = getAppPaths();
+  const preflight = buildPreflightReport(paths);
+  const retention = loadRetentionPolicy();
+  const setupMarker = readJsonFile(paths.setupMarkerPath);
+
+  let backendDiagnostics = null;
+  let backendError = null;
+  try {
+    const response = await axios.get(`${PYTHON_SERVER_URL}/diagnostics`, { timeout: 8000 });
+    backendDiagnostics = response.data;
+  } catch (error) {
+    backendError = error.message;
+  }
+
+  const diagnostics = {
+    capturedAt: formatLocalTimestamp(),
+    timezone: getLocalTimezone(),
+    app: {
+      version: app.getVersion(),
+      isPackaged: app.isPackaged,
+      electron: process.versions.electron,
+      node: process.versions.node,
+      chrome: process.versions.chrome,
+      platform: process.platform,
+      arch: process.arch
+    },
+    startupStatus,
+    paths: {
+      userData: app.getPath('userData'),
+      pythonEnvRoot: paths.pythonEnvRoot,
+      cacheRoot: paths.cacheRoot,
+      huggingFaceRoot: paths.huggingFaceRoot
+    },
+    setupMarker,
+    preflight,
+    retention,
+    backendDiagnostics,
+    backendDiagnosticsError: backendError
+  };
+
+  const defaultPath = path.join(app.getPath('downloads'), `deepseek-ocr-diagnostics-${Date.now()}.zip`);
+  const saveResult = await dialog.showSaveDialog(mainWindow, {
+    title: 'Save Diagnostics Bundle',
+    defaultPath,
+    filters: [{ name: 'ZIP Archive', extensions: ['zip'] }]
+  });
+
+  if (saveResult.canceled || !saveResult.filePath) {
+    return { success: false, canceled: true };
+  }
+
+  const zip = new JSZip();
+  const zipEntryDate = getZipEntryLocalDate();
+  zip.file('diagnostics.json', JSON.stringify(diagnostics, null, 2), { date: zipEntryDate });
+  zip.file('main-logs.json', JSON.stringify(getMainLogTail(600), null, 2), { date: zipEntryDate });
+  if (backendDiagnostics && Array.isArray(backendDiagnostics.logs_tail)) {
+    zip.file('backend-logs.txt', backendDiagnostics.logs_tail.join(os.EOL), { date: zipEntryDate });
+  }
+
+  const buffer = await zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE', compressionOptions: { level: 6 } });
+  fs.writeFileSync(saveResult.filePath, buffer);
+  appendMainLog('info', 'diagnostics', `Saved diagnostics bundle to ${saveResult.filePath}`);
+  return { success: true, filePath: saveResult.filePath };
+}
+
+async function saveDocumentZip(markdownText) {
+  const paths = getAppPaths();
+  const outputsDir = path.join(paths.cacheRoot, 'outputs');
+  const imagesDir = path.join(outputsDir, 'images');
+  const zip = new JSZip();
+  const zipEntryDate = getZipEntryLocalDate();
+  zip.file('output.md', markdownText || '', { date: zipEntryDate });
+
+  const imageNames = parseMarkdownImageNames(markdownText || '');
+  if (imageNames.length > 0) {
+    const imageFolder = zip.folder('images');
+    for (const imageName of imageNames) {
+      const imagePath = path.join(imagesDir, imageName);
+      if (fs.existsSync(imagePath) && fs.statSync(imagePath).isFile()) {
+        imageFolder.file(imageName, fs.readFileSync(imagePath), { date: zipEntryDate });
+      }
+    }
+  }
+
+  const saveResult = await dialog.showSaveDialog(mainWindow, {
+    title: 'Save OCR ZIP',
+    defaultPath: path.join(app.getPath('downloads'), `ocr-output-${Date.now()}.zip`),
+    filters: [{ name: 'ZIP Archive', extensions: ['zip'] }]
+  });
+  if (saveResult.canceled || !saveResult.filePath) {
+    return { success: false, canceled: true };
+  }
+
+  const buffer = await zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE', compressionOptions: { level: 6 } });
+  fs.writeFileSync(saveResult.filePath, buffer);
+  return { success: true, filePath: saveResult.filePath, imageCount: imageNames.length };
 }
 
 // IPC Handlers
@@ -710,6 +1183,24 @@ ipcMain.handle('select-folder', async () => {
   return { success: false };
 });
 
+ipcMain.handle('list-folder-inputs', async (event, folderPath) => {
+  try {
+    if (!folderPath || !fs.existsSync(folderPath)) {
+      return { success: false, error: 'Folder does not exist' };
+    }
+    const entries = fs.readdirSync(folderPath, { withFileTypes: true });
+    const files = entries
+      .filter((entry) => entry.isFile())
+      .map((entry) => entry.name)
+      .filter((name) => Object.prototype.hasOwnProperty.call(INPUT_MIME_TYPES, path.extname(name).toLowerCase()))
+      .sort((a, b) => a.localeCompare(b))
+      .map((name) => path.join(folderPath, name));
+    return { success: true, filePaths: files };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+
 ipcMain.handle('open-folder', async (event, folderPath) => {
   try {
     shell.openPath(folderPath);
@@ -719,7 +1210,14 @@ ipcMain.handle('open-folder', async (event, folderPath) => {
   }
 });
 
-ipcMain.handle('perform-ocr', async (event, { imagePath, promptType, baseSize, imageSize, cropMode }) => {
+ipcMain.handle('perform-ocr', async (event, {
+  imagePath,
+  promptType,
+  baseSize,
+  imageSize,
+  cropMode,
+  pdfPageRange
+}) => {
   try {
     const FormData = require('form-data');
     const formData = new FormData();
@@ -735,6 +1233,9 @@ ipcMain.handle('perform-ocr', async (event, { imagePath, promptType, baseSize, i
     formData.append('base_size', baseSize || 1024);
     formData.append('image_size', imageSize || 640);
     formData.append('crop_mode', cropMode ? 'true' : 'false');
+    if (pdfPageRange) {
+      formData.append('pdf_page_range', String(pdfPageRange));
+    }
 
     const response = await axios.post(`${PYTHON_SERVER_URL}/ocr`, formData, {
       headers: formData.getHeaders(),
@@ -753,7 +1254,14 @@ ipcMain.handle('perform-ocr', async (event, { imagePath, promptType, baseSize, i
 });
 
 // Queue operations
-ipcMain.handle('add-to-queue', async (event, { filePaths, promptType, baseSize, imageSize, cropMode }) => {
+ipcMain.handle('add-to-queue', async (event, {
+  filePaths,
+  promptType,
+  baseSize,
+  imageSize,
+  cropMode,
+  pdfPageRange
+}) => {
   try {
     const FormData = require('form-data');
     const formData = new FormData();
@@ -771,6 +1279,9 @@ ipcMain.handle('add-to-queue', async (event, { filePaths, promptType, baseSize, 
     formData.append('base_size', baseSize || 1024);
     formData.append('image_size', imageSize || 640);
     formData.append('crop_mode', cropMode ? 'true' : 'false');
+    if (pdfPageRange) {
+      formData.append('pdf_page_range', String(pdfPageRange));
+    }
 
     const response = await axios.post(`${PYTHON_SERVER_URL}/queue/add`, formData, {
       headers: formData.getHeaders(),
@@ -825,6 +1336,114 @@ ipcMain.handle('remove-from-queue', async (event, itemId) => {
   try {
     const response = await axios.delete(`${PYTHON_SERVER_URL}/queue/remove/${itemId}`);
     return { success: true, data: response.data };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('pause-queue', async () => {
+  try {
+    const response = await axios.post(`${PYTHON_SERVER_URL}/queue/pause`);
+    return { success: true, data: response.data };
+  } catch (error) {
+    return {
+      success: false,
+      error: error.response?.data?.message || error.message
+    };
+  }
+});
+
+ipcMain.handle('resume-queue', async () => {
+  try {
+    const response = await axios.post(`${PYTHON_SERVER_URL}/queue/resume`);
+    return { success: true, data: response.data };
+  } catch (error) {
+    return {
+      success: false,
+      error: error.response?.data?.message || error.message
+    };
+  }
+});
+
+ipcMain.handle('cancel-queue', async () => {
+  try {
+    const response = await axios.post(`${PYTHON_SERVER_URL}/queue/cancel`);
+    return { success: true, data: response.data };
+  } catch (error) {
+    return {
+      success: false,
+      error: error.response?.data?.message || error.message
+    };
+  }
+});
+
+ipcMain.handle('retry-failed-queue', async () => {
+  try {
+    const response = await axios.post(`${PYTHON_SERVER_URL}/queue/retry_failed`);
+    return { success: true, data: response.data };
+  } catch (error) {
+    return {
+      success: false,
+      error: error.response?.data?.message || error.message
+    };
+  }
+});
+
+ipcMain.handle('run-preflight-check', async () => {
+  try {
+    const paths = getAppPaths();
+    const report = buildPreflightReport(paths);
+    return {
+      success: true,
+      data: {
+        ...report,
+        retentionPolicy: loadRetentionPolicy()
+      }
+    };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('export-diagnostics', async () => {
+  try {
+    return await exportDiagnosticsBundle();
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('save-document-zip', async (event, { markdownText }) => {
+  try {
+    return await saveDocumentZip(markdownText || '');
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('get-retention-policy', async () => {
+  try {
+    return { success: true, data: loadRetentionPolicy() };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('update-retention-policy', async (event, policy) => {
+  try {
+    const savedPolicy = saveRetentionPolicy(policy || {});
+    return { success: true, data: savedPolicy };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('apply-retention-cleanup', async () => {
+  try {
+    const paths = getAppPaths();
+    const policy = loadRetentionPolicy();
+    const report = applyRetentionPolicy(paths, policy);
+    return { success: true, data: report };
   } catch (error) {
     return { success: false, error: error.message };
   }

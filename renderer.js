@@ -1,7 +1,4 @@
-const { ipcRenderer } = require('electron');
-const { marked } = require('marked');
-const JSZip = require('jszip');
-const path = require('path');
+const api = window.appAPI;
 
 // DOM Elements
 const dropZone = document.getElementById('drop-zone');
@@ -22,6 +19,14 @@ const ocrPreviewImage = document.getElementById('ocr-preview-image');
 const ocrBoxesOverlay = document.getElementById('ocr-boxes-overlay');
 const progressInline = document.getElementById('progress-inline');
 const progressStatus = document.getElementById('progress-status');
+const preflightBtn = document.getElementById('preflight-btn');
+const diagnosticsBtn = document.getElementById('diagnostics-btn');
+const preflightPanel = document.getElementById('preflight-panel');
+const preflightSummary = document.getElementById('preflight-summary');
+const preflightDetails = document.getElementById('preflight-details');
+const messageBanner = document.getElementById('message-banner');
+const uiModeBasicBtn = document.getElementById('ui-mode-basic-btn');
+const uiModeAdvancedBtn = document.getElementById('ui-mode-advanced-btn');
 
 // Lightbox elements
 const lightbox = document.getElementById('lightbox');
@@ -44,17 +49,29 @@ const promptType = document.getElementById('prompt-type');
 const baseSize = document.getElementById('base-size');
 const imageSize = document.getElementById('image-size');
 const cropMode = document.getElementById('crop-mode');
+const pdfPageRange = document.getElementById('pdf-page-range');
 
 // Queue elements
 const queueCount = document.getElementById('queue-count');
 const addFilesBtn = document.getElementById('add-files-btn');
 const addFolderBtn = document.getElementById('add-folder-btn');
 const processQueueBtn = document.getElementById('process-queue-btn');
+const pauseQueueBtn = document.getElementById('pause-queue-btn');
+const resumeQueueBtn = document.getElementById('resume-queue-btn');
+const cancelQueueBtn = document.getElementById('cancel-queue-btn');
+const retryFailedBtn = document.getElementById('retry-failed-btn');
 const clearQueueBtn = document.getElementById('clear-queue-btn');
 const openOutputBtn = document.getElementById('open-output-btn');
 const queueList = document.getElementById('queue-list');
 const queueProgressText = document.getElementById('queue-progress-text');
 const queueProgressBar = document.getElementById('queue-progress-bar');
+const retentionOutputDays = document.getElementById('retention-output-days');
+const retentionMaxRuns = document.getElementById('retention-max-runs');
+const retentionCacheDays = document.getElementById('retention-cache-days');
+const retentionCleanupStartup = document.getElementById('retention-cleanup-startup');
+const saveRetentionBtn = document.getElementById('save-retention-btn');
+const runCleanupBtn = document.getElementById('run-cleanup-btn');
+const retentionStatus = document.getElementById('retention-status');
 
 // Constants
 const DEEPSEEK_COORD_MAX = 999;
@@ -64,11 +81,13 @@ const STARTUP_PHASE_LABELS = {
     'setup-ready': 'Using existing environment',
     'setup-init': 'Initializing setup',
     'setup-detect-hardware': 'Detecting hardware',
+    'setup-hardware-change': 'Refreshing for hardware',
     'setup-install-python': 'Installing Python',
     'setup-create-venv': 'Creating virtual environment',
     'setup-install-deps': 'Installing dependencies',
     'setup-verify': 'Verifying environment',
     'setup-complete': 'Setup complete',
+    cleanup: 'Cleaning cache',
     'backend-init': 'Preparing backend',
     'dev-env': 'Using development environment',
     'backend-launch': 'Launching backend',
@@ -106,9 +125,12 @@ let currentQueueFolder = null;
 let lastProcessedFileId = null;
 let lastQueuePreviewImagePath = null;
 let startupHideTimer = null;
+let uiMode = 'advanced';
+const progressUpdateTimes = new WeakMap();
+let messageHideTimer = null;
 
 function isPdfPath(filePath) {
-    return path.extname(filePath || '').toLowerCase() === '.pdf';
+    return api.extname(filePath || '') === '.pdf';
 }
 
 function sleep(ms) {
@@ -123,11 +145,54 @@ function clampPercent(value) {
     return Math.max(0, Math.min(100, Math.round(numeric)));
 }
 
-async function waitForModelLoadCompletion(timeoutMs = 180000, pollMs = 500) {
+function setProgressBarWidth(barEl, percent) {
+    if (!barEl) return;
+    const next = clampPercent(percent);
+    const now = performance.now();
+    const lastUpdate = progressUpdateTimes.get(barEl) || 0;
+    if (now - lastUpdate < 80) {
+        return;
+    }
+    progressUpdateTimes.set(barEl, now);
+    barEl.style.width = `${next}%`;
+}
+
+function formatBytes(bytes) {
+    const numeric = Number(bytes);
+    if (!Number.isFinite(numeric) || numeric < 0) {
+        return 'Unknown';
+    }
+    if (numeric === 0) {
+        return '0 B';
+    }
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    let value = numeric;
+    let unitIndex = 0;
+    while (value >= 1024 && unitIndex < units.length - 1) {
+        value /= 1024;
+        unitIndex += 1;
+    }
+    return `${value.toFixed(unitIndex === 0 ? 0 : 1)} ${units[unitIndex]}`;
+}
+
+function sanitizePageRangeInput(value) {
+    const text = (value || '').trim();
+    if (!text) {
+        return '';
+    }
+    if (!/^[0-9,\-\s]+$/.test(text)) {
+        throw new Error('PDF page range can only include digits, commas, spaces, and hyphens');
+    }
+    return text;
+}
+
+async function waitForModelLoadCompletion(timeoutMs = 1200000, pollMs = 500) {
     const startedAt = Date.now();
     let lastPercent = 0;
+    let loopCount = 0;
 
     while (Date.now() - startedAt < timeoutMs) {
+        loopCount += 1;
         try {
             const response = await fetch('http://127.0.0.1:5000/progress');
             const data = await response.json();
@@ -148,22 +213,74 @@ async function waitForModelLoadCompletion(timeoutMs = 180000, pollMs = 500) {
             // Transient polling failures are expected while backend state changes.
         }
 
+        // Some backends can report model loaded before progress leaves warmup.
+        if (loopCount % 3 === 0) {
+            try {
+                const statusResult = await api.checkServerStatus();
+                if (statusResult.success && statusResult.data?.model_loaded) {
+                    progressStatus.textContent = 'Model loaded successfully!';
+                    return { status: 'loaded', message: 'Model loaded (health endpoint confirmed)' };
+                }
+            } catch (error) {
+                // Ignore transient health-check failures while backend starts.
+            }
+        }
+
         await sleep(pollMs);
     }
 
     return { status: 'timeout', message: 'Timed out waiting for model loading progress' };
 }
 
-window.addEventListener('DOMContentLoaded', () => {
-    marked.setOptions({
-        mangle: false,
-        headerIds: false,
-        breaks: true
-    });
+async function ensureModelLoadedForRun() {
+    const statusResult = await api.checkServerStatus();
+    if (!statusResult.success) {
+        throw new Error(`Backend unavailable: ${statusResult.error || 'Unable to reach backend service'}`);
+    }
 
+    if (statusResult.data?.model_loaded) {
+        return;
+    }
+
+    progressInline.style.display = 'flex';
+    progressStatus.textContent = 'Model not loaded. Starting automatic load...';
+
+    const loadResult = await api.loadModel();
+    if (!loadResult.success) {
+        throw new Error(`Failed to start model loading: ${loadResult.error || 'Unknown error'}`);
+    }
+
+    const finalProgress = await waitForModelLoadCompletion(1200000, 600);
+    if (finalProgress.status === 'loaded') {
+        progressStatus.textContent = 'Model loaded. Starting OCR...';
+        return;
+    }
+
+    if (finalProgress.status === 'error') {
+        throw new Error(finalProgress.message || 'Model loading failed');
+    }
+
+    // If progress polling timed out, do one final readiness check.
+    try {
+        const finalStatus = await api.checkServerStatus();
+        if (finalStatus.success && finalStatus.data?.model_loaded) {
+            progressStatus.textContent = 'Model loaded. Starting OCR...';
+            return;
+        }
+    } catch (error) {
+        // Fall through to timeout error.
+    }
+
+    throw new Error('Model loading timed out. Please check diagnostics/logs and retry.');
+}
+
+window.addEventListener('DOMContentLoaded', () => {
+    initializeUiMode();
+    initializeRetentionPolicy();
     initializeStartupStatus();
     checkServerStatus();
     setupEventListeners();
+    updateQueueDisplay();
     setInterval(checkServerStatus, 5000);
 });
 
@@ -199,7 +316,7 @@ function renderStartupStatus(status) {
     startupPhase.textContent = formatStartupPhase(status.phase);
     startupMessage.textContent = status.message || 'Preparing application...';
     startupPercent.textContent = `${progress}%`;
-    startupProgressBar.style.width = `${progress}%`;
+    setProgressBarWidth(startupProgressBar, progress);
 
     if (state === 'ready') {
         startupHideTimer = setTimeout(() => {
@@ -209,12 +326,12 @@ function renderStartupStatus(status) {
 }
 
 async function initializeStartupStatus() {
-    ipcRenderer.on('startup-status', (event, status) => {
+    api.onStartupStatus((status) => {
         renderStartupStatus(status);
     });
 
     try {
-        const status = await ipcRenderer.invoke('get-startup-status');
+        const status = await api.getStartupStatus();
         renderStartupStatus(status);
     } catch (error) {
         console.error('Failed to get startup status:', error);
@@ -238,17 +355,17 @@ function setupEventListeners() {
     // Drag and drop
     dropZone.addEventListener('dragover', (e) => {
         e.preventDefault();
-        dropZone.style.background = '#e8eaff';
+        dropZone.classList.add('is-drag-over');
     });
 
     dropZone.addEventListener('dragleave', (e) => {
         e.preventDefault();
-        dropZone.style.background = '#f8f9ff';
+        dropZone.classList.remove('is-drag-over');
     });
 
     dropZone.addEventListener('drop', (e) => {
         e.preventDefault();
-        dropZone.style.background = '#f8f9ff';
+        dropZone.classList.remove('is-drag-over');
 
         const files = e.dataTransfer.files;
         if (files.length > 0) {
@@ -286,13 +403,145 @@ function setupEventListeners() {
     addFilesBtn.addEventListener('click', addFilesToQueue);
     addFolderBtn.addEventListener('click', addFolderToQueue);
     processQueueBtn.addEventListener('click', processQueue);
+    pauseQueueBtn.addEventListener('click', pauseQueue);
+    resumeQueueBtn.addEventListener('click', resumeQueue);
+    cancelQueueBtn.addEventListener('click', cancelQueue);
+    retryFailedBtn.addEventListener('click', retryFailedQueueItems);
     clearQueueBtn.addEventListener('click', clearQueue);
     openOutputBtn.addEventListener('click', openOutputFolder);
+    preflightBtn.addEventListener('click', runPreflightCheck);
+    diagnosticsBtn.addEventListener('click', exportDiagnosticsBundle);
+    uiModeBasicBtn.addEventListener('click', () => applyUiMode('basic'));
+    uiModeAdvancedBtn.addEventListener('click', () => applyUiMode('advanced'));
+    saveRetentionBtn.addEventListener('click', saveRetentionPolicy);
+    runCleanupBtn.addEventListener('click', runRetentionCleanup);
+}
+
+function applyUiMode(nextMode) {
+    uiMode = nextMode === 'basic' ? 'basic' : 'advanced';
+    document.body.setAttribute('data-ui-mode', uiMode);
+    uiModeBasicBtn.classList.toggle('active', uiMode === 'basic');
+    uiModeAdvancedBtn.classList.toggle('active', uiMode === 'advanced');
+    localStorage.setItem('deepseek-ocr-ui-mode', uiMode);
+
+    if (uiMode === 'basic') {
+        viewBoxesBtn.style.display = 'none';
+        viewTokensBtn.style.display = 'none';
+    } else if (currentRawTokens) {
+        viewTokensBtn.style.display = 'inline-block';
+        viewBoxesBtn.style.display = 'inline-block';
+    }
+}
+
+function initializeUiMode() {
+    const storedMode = localStorage.getItem('deepseek-ocr-ui-mode');
+    applyUiMode(storedMode || 'advanced');
+}
+
+async function initializeRetentionPolicy() {
+    try {
+        const result = await api.getRetentionPolicy();
+        if (!result.success) {
+            return;
+        }
+        const policy = result.data || {};
+        retentionOutputDays.value = String(policy.outputRetentionDays ?? 30);
+        retentionMaxRuns.value = String(policy.maxQueueRuns ?? 40);
+        retentionCacheDays.value = String(policy.downloadCacheRetentionDays ?? 30);
+        retentionCleanupStartup.checked = Boolean(policy.cleanupOnStartup);
+    } catch (error) {
+        console.error('Failed to load retention policy:', error);
+    }
+}
+
+function collectRetentionPolicyInput() {
+    return {
+        outputRetentionDays: parseInt(retentionOutputDays.value, 10),
+        maxQueueRuns: parseInt(retentionMaxRuns.value, 10),
+        downloadCacheRetentionDays: parseInt(retentionCacheDays.value, 10),
+        cleanupOnStartup: retentionCleanupStartup.checked
+    };
+}
+
+async function saveRetentionPolicy() {
+    retentionStatus.textContent = 'Saving...';
+    const result = await api.updateRetentionPolicy(collectRetentionPolicyInput());
+    if (result.success) {
+        retentionStatus.textContent = 'Policy saved';
+    } else {
+        retentionStatus.textContent = `Save failed: ${result.error}`;
+    }
+}
+
+async function runRetentionCleanup() {
+    retentionStatus.textContent = 'Running cleanup...';
+    const result = await api.applyRetentionCleanup();
+    if (!result.success) {
+        retentionStatus.textContent = `Cleanup failed: ${result.error}`;
+        return;
+    }
+
+    const report = result.data || {};
+    retentionStatus.textContent = `Removed ${report.removedQueueRuns || 0} queue runs, ${report.removedCacheFiles || 0} cache files`;
+}
+
+async function runPreflightCheck() {
+    preflightSummary.textContent = 'Checking...';
+    preflightDetails.textContent = '';
+    preflightPanel.style.display = 'block';
+
+    const result = await api.runPreflightCheck();
+    if (!result.success) {
+        preflightSummary.textContent = 'Failed';
+        preflightDetails.textContent = result.error || 'Preflight check failed';
+        return;
+    }
+
+    const data = result.data || {};
+    const free = data.freeDiskBytes;
+    const diskOk = data.diskOk;
+    preflightSummary.textContent = diskOk === null ? 'Disk check unavailable' : (diskOk ? 'Disk OK' : 'Low disk');
+    preflightDetails.textContent = [
+        `Setup complete: ${data.setupComplete ? 'Yes' : 'No'}`,
+        `Model cache present: ${data.modelCachePresent ? 'Yes' : 'No'}`,
+        `Expected download: ${formatBytes(data.expectedDownloadBytes)}`,
+        `Estimated required space: ${formatBytes(data.expectedRequiredBytes)}`,
+        `Free disk space: ${free === null ? 'Unknown' : formatBytes(free)}`,
+        `Estimated time @100 Mbps: ${data.estimatedMinutes?.fast_100mbps ?? 0} min`,
+        `Estimated time @30 Mbps: ${data.estimatedMinutes?.typical_30mbps ?? 0} min`,
+        `Estimated time @10 Mbps: ${data.estimatedMinutes?.slow_10mbps ?? 0} min`
+    ].join('\n');
+}
+
+async function exportDiagnosticsBundle() {
+    diagnosticsBtn.disabled = true;
+    const original = diagnosticsBtn.textContent;
+    diagnosticsBtn.textContent = 'Exporting...';
+    try {
+        const result = await api.exportDiagnostics();
+        if (result.success) {
+            diagnosticsBtn.textContent = 'Diagnostics Saved';
+            showMessage(`Diagnostics exported: ${result.filePath}`, 'success');
+        } else if (result.canceled) {
+            diagnosticsBtn.textContent = original;
+        } else {
+            diagnosticsBtn.textContent = original;
+            showMessage(`Diagnostics export failed: ${result.error}`, 'error');
+        }
+    } catch (error) {
+        diagnosticsBtn.textContent = original;
+        showMessage(`Diagnostics export failed: ${error.message}`, 'error');
+    } finally {
+        setTimeout(() => {
+            diagnosticsBtn.textContent = original;
+            diagnosticsBtn.disabled = false;
+        }, 1200);
+    }
 }
 
 async function checkServerStatus() {
     try {
-        const result = await ipcRenderer.invoke('check-server-status');
+        const result = await api.checkServerStatus();
 
         if (result.success) {
             serverStatus.textContent = 'Connected';
@@ -302,9 +551,24 @@ async function checkServerStatus() {
             modelStatus.textContent = modelLoaded ? 'Loaded' : 'Not loaded';
             modelStatus.className = `status-value ${modelLoaded ? 'success' : 'warning'}`;
 
-            const gpuAvailable = result.data.gpu_available;
-            gpuStatus.textContent = gpuAvailable ? 'Available' : 'CPU Only';
-            gpuStatus.className = `status-value ${gpuAvailable ? 'success' : 'warning'}`;
+            const preferredDevice = String(result.data.preferred_device || result.data.device_state || 'cpu').toLowerCase();
+            const activeDevice = String(result.data.device_state || 'cpu').toLowerCase();
+            const effectiveDevice = modelLoaded ? activeDevice : preferredDevice;
+            const hasGpuReady = effectiveDevice === 'cuda' || effectiveDevice === 'mps';
+
+            if (modelLoaded && activeDevice === 'cpu' && (preferredDevice === 'cuda' || preferredDevice === 'mps')) {
+                gpuStatus.textContent = 'CPU (fallback)';
+                gpuStatus.className = 'status-value warning';
+            } else if (effectiveDevice === 'cuda') {
+                gpuStatus.textContent = modelLoaded ? 'CUDA Active' : 'CUDA Ready';
+                gpuStatus.className = 'status-value success';
+            } else if (effectiveDevice === 'mps') {
+                gpuStatus.textContent = modelLoaded ? 'Apple MPS Active' : 'Apple MPS Ready';
+                gpuStatus.className = 'status-value success';
+            } else {
+                gpuStatus.textContent = hasGpuReady ? 'Available' : 'CPU Only';
+                gpuStatus.className = `status-value ${hasGpuReady ? 'success' : 'warning'}`;
+            }
 
             // Update load model button state (but don't change if currently processing)
             if (!isProcessing) {
@@ -319,9 +583,9 @@ async function checkServerStatus() {
                 }
             }
 
-            // Update OCR button state - only enable if both image loaded AND model loaded (and not currently processing)
+            // Update OCR button state - allow run with a selected input; model can auto-load on run.
             if (!isProcessing) {
-                if (currentImagePath && modelLoaded) {
+                if (currentImagePath) {
                     ocrBtn.disabled = false;
                 } else {
                     ocrBtn.disabled = true;
@@ -344,7 +608,7 @@ async function checkServerStatus() {
 }
 
 async function selectImage() {
-    const result = await ipcRenderer.invoke('select-image');
+    const result = await api.selectImage();
 
     if (result.success) {
         loadImage(result.filePath);
@@ -353,8 +617,9 @@ async function selectImage() {
 
 async function loadImage(filePath) {
     currentImagePath = filePath;
+    dropZone.classList.remove('is-drag-over');
     const isPdf = isPdfPath(filePath);
-    const fileName = path.basename(filePath);
+    const fileName = api.basename(filePath);
 
     if (isPdf) {
         imagePreview.src = '';
@@ -376,7 +641,8 @@ async function loadImage(filePath) {
     previewSection.style.display = 'block';
 
     // Clear previous results
-    ocrPreviewImage.src = '';
+    ocrPreviewImage.removeAttribute('src');
+    ocrPreviewImage.style.display = 'none';
     resultsContent.innerHTML = '';
     progressInline.style.display = 'none';
     copyBtn.style.display = 'none';
@@ -395,6 +661,7 @@ async function loadImage(filePath) {
 
 function clearImage() {
     currentImagePath = null;
+    dropZone.classList.remove('is-drag-over');
     currentResultText = null;
     currentRawTokens = null;
     currentPromptType = null;
@@ -412,7 +679,8 @@ function clearImage() {
     viewTokensBtn.style.display = 'none';
 
     // Clear results and progress
-    ocrPreviewImage.src = '';
+    ocrPreviewImage.removeAttribute('src');
+    ocrPreviewImage.style.display = 'none';
     resultsContent.innerHTML = '';
     progressInline.style.display = 'none';
     copyBtn.style.display = 'none';
@@ -793,7 +1061,7 @@ async function loadModel() {
         progressStatus.textContent = 'Loading model...';
 
         // Trigger model loading
-        const result = await ipcRenderer.invoke('load-model');
+        const result = await api.loadModel();
         if (!result.success) {
             progressInline.style.display = 'none';
             showMessage(`Failed to load model: ${result.error}`, 'error');
@@ -837,14 +1105,21 @@ async function performOCR() {
     try {
         isProcessing = true;
         ocrBtn.disabled = true;
-        ocrBtnText.textContent = 'Processing...';
+        ocrBtnText.textContent = 'Preparing...';
 
         // Store current prompt type
         currentPromptType = promptType.value;
 
         // Show progress in header
         progressInline.style.display = 'flex';
+        progressStatus.textContent = 'Preparing OCR...';
+
+        // Auto-load model when needed before OCR request starts.
+        await ensureModelLoadedForRun();
+
+        ocrBtnText.textContent = 'Processing...';
         progressStatus.textContent = 'Starting OCR...';
+        const ocrStartedAt = Date.now();
 
         // Clear panels
         resultsContent.innerHTML = '';
@@ -856,14 +1131,25 @@ async function performOCR() {
         ocrBoxesOverlay.removeAttribute('viewBox');
 
         // Load image into preview and get dimensions
-        ocrPreviewImage.src = currentImagePath;
+        ocrPreviewImage.style.display = 'none';
         await new Promise((resolve) => {
-            ocrPreviewImage.onload = () => {
+            let settled = false;
+            const finalize = () => {
                 imageNaturalWidth = ocrPreviewImage.naturalWidth;
                 imageNaturalHeight = ocrPreviewImage.naturalHeight;
                 console.log(`Image dimensions: ${imageNaturalWidth}×${imageNaturalHeight}`);
-                resolve();
+                if (imageNaturalWidth > 0 && imageNaturalHeight > 0) {
+                    ocrPreviewImage.style.display = 'block';
+                }
+                if (!settled) {
+                    settled = true;
+                    resolve();
+                }
             };
+            ocrPreviewImage.onload = finalize;
+            ocrPreviewImage.onerror = finalize;
+            ocrPreviewImage.src = currentImagePath;
+            setTimeout(finalize, 2000);
         });
 
         // Poll for token count and raw token stream updates
@@ -872,9 +1158,24 @@ async function performOCR() {
                 const response = await fetch('http://127.0.0.1:5000/progress');
                 const data = await response.json();
 
+                if (data.status === 'loading') {
+                    const percent = clampPercent(data.progress_percent || 0);
+                    const stageText = data.message || data.stage || 'Loading model...';
+                    progressStatus.textContent = `Loading model ${percent}% - ${stageText}`;
+                    return;
+                }
+
                 if (data.status === 'processing') {
+                    const elapsedSeconds = Math.max(1, Math.floor((Date.now() - ocrStartedAt) / 1000));
                     if (data.chars_generated > 0) {
-                        progressStatus.textContent = `${data.chars_generated} characters generated`;
+                        progressStatus.textContent = `${data.chars_generated} characters generated (${elapsedSeconds}s)`;
+                    } else if (data.message) {
+                        const hasElapsedInMessage = /\belapsed\b/i.test(data.message);
+                        progressStatus.textContent = hasElapsedInMessage
+                            ? data.message
+                            : `${data.message} (${elapsedSeconds}s)`;
+                    } else {
+                        progressStatus.textContent = `Processing OCR... (${elapsedSeconds}s)`;
                     }
 
                     // Parse and render boxes from raw token stream
@@ -899,16 +1200,19 @@ async function performOCR() {
                     }
                 }
             } catch (error) {
-                // Ignore polling errors
+                const elapsedSeconds = Math.max(1, Math.floor((Date.now() - ocrStartedAt) / 1000));
+                progressStatus.textContent = `Processing OCR... (${elapsedSeconds}s)`;
             }
-        }, 200); // Poll every 200ms for smooth updates
+        }, 700); // Poll less frequently to reduce backend contention during long OCR runs
 
-        const result = await ipcRenderer.invoke('perform-ocr', {
+        const pageRange = isPdfPath(currentImagePath) ? sanitizePageRangeInput(pdfPageRange?.value || '') : '';
+        const result = await api.performOCR({
             imagePath: currentImagePath,
             promptType: promptType.value,
             baseSize: parseInt(baseSize.value),
             imageSize: parseInt(imageSize.value),
-            cropMode: cropMode.checked
+            cropMode: cropMode.checked,
+            pdfPageRange: pageRange
         });
 
         // Stop polling
@@ -962,7 +1266,7 @@ async function performOCR() {
             }
 
             // Show raw tokens button and boxes button if raw tokens exist
-            if (currentRawTokens) {
+            if (currentRawTokens && uiMode === 'advanced') {
                 viewTokensBtn.style.display = 'inline-block';
                 viewBoxesBtn.style.display = 'inline-block';
             } else {
@@ -977,7 +1281,8 @@ async function performOCR() {
             ocrBoxesOverlay.removeAttribute('viewBox');
             lastBoxCount = 0;
 
-            ocrPreviewImage.src = '';
+            ocrPreviewImage.removeAttribute('src');
+            ocrPreviewImage.style.display = 'none';
             progressInline.style.display = 'none';
             resultsContent.innerHTML = `<p class="error">Error: ${result.error}</p>`;
             copyBtn.style.display = 'none';
@@ -993,7 +1298,8 @@ async function performOCR() {
         ocrBoxesOverlay.innerHTML = '';
         ocrBoxesOverlay.removeAttribute('viewBox');
         lastBoxCount = 0;
-        ocrPreviewImage.src = '';
+        ocrPreviewImage.removeAttribute('src');
+        ocrPreviewImage.style.display = 'none';
         progressInline.style.display = 'none';
         resultsContent.innerHTML = `<p class="error">Error: ${error.message}</p>`;
         copyBtn.style.display = 'none';
@@ -1034,7 +1340,7 @@ function displayResults(result, promptType) {
             /!\[([^\]]*)\]\(images\/([^)]+)\)/g,
             `![$1](http://127.0.0.1:5000/outputs/images/$2?t=${cacheBuster})`
         );
-        resultsContent.innerHTML = marked.parse(renderedMarkdown);
+        resultsContent.innerHTML = api.renderMarkdown(renderedMarkdown);
     } else {
         resultsContent.textContent = formattedResult;
     }
@@ -1062,69 +1368,28 @@ async function downloadZip() {
     }
 
     try {
-        // Show loading state
         const originalText = downloadZipBtn.textContent;
-        downloadZipBtn.textContent = 'Creating ZIP...';
+        downloadZipBtn.textContent = 'Saving ZIP...';
         downloadZipBtn.disabled = true;
 
-        // Create a new JSZip instance
-        const zip = new JSZip();
-
-        // Add the markdown file
-        zip.file('output.md', currentResultText);
-
-        // Find all image references in the markdown
-        const imageRegex = /!\[([^\]]*)\]\(images\/([^)]+)\)/g;
-        const imageFiles = new Set();
-        let match;
-
-        while ((match = imageRegex.exec(currentResultText)) !== null) {
-            imageFiles.add(match[2]); // Extract filename like "0.jpg"
+        const result = await api.saveDocumentZip(currentResultText);
+        if (result.success) {
+            downloadZipBtn.textContent = 'Saved';
+            showMessage('ZIP file saved successfully', 'success');
+        } else if (result.canceled) {
+            downloadZipBtn.textContent = originalText;
+        } else {
+            downloadZipBtn.textContent = originalText;
+            showMessage(`Failed to save ZIP: ${result.error || 'Unknown error'}`, 'error');
         }
 
-        // Fetch and add each image to the zip
-        const imagesFolder = zip.folder('images');
-        const imagePromises = Array.from(imageFiles).map(async (filename) => {
-            try {
-                const response = await fetch(`http://127.0.0.1:5000/outputs/images/${filename}`);
-                if (response.ok) {
-                    const blob = await response.blob();
-                    imagesFolder.file(filename, blob);
-                } else {
-                    console.warn(`Failed to fetch image: ${filename}`);
-                }
-            } catch (error) {
-                console.error(`Error fetching image ${filename}:`, error);
-            }
-        });
-
-        // Wait for all images to be fetched
-        await Promise.all(imagePromises);
-
-        // Generate the zip file
-        const zipBlob = await zip.generateAsync({ type: 'blob' });
-
-        // Create download link and trigger download
-        const url = URL.createObjectURL(zipBlob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = `ocr-output-${Date.now()}.zip`;
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        URL.revokeObjectURL(url);
-
-        // Reset button state
-        downloadZipBtn.textContent = 'Downloaded!';
         setTimeout(() => {
             downloadZipBtn.textContent = originalText;
             downloadZipBtn.disabled = false;
-        }, 2000);
-
-        showMessage('ZIP file downloaded successfully', 'success');
+        }, 1200);
     } catch (error) {
-        console.error('Error creating ZIP:', error);
-        showMessage('Failed to create ZIP file', 'error');
+        console.error('Error saving ZIP:', error);
+        showMessage('Failed to save ZIP file', 'error');
         downloadZipBtn.textContent = 'Download ZIP';
         downloadZipBtn.disabled = false;
     }
@@ -1132,15 +1397,29 @@ async function downloadZip() {
 
 function showMessage(message, type = 'info') {
     console.log(`[${type.toUpperCase()}] ${message}`);
-    if (resultsContent.textContent.includes('OCR results will appear here')) {
-        resultsContent.innerHTML = `<p class="${type}">${message}</p>`;
+    if (!messageBanner) {
+        return;
     }
+
+    if (messageHideTimer) {
+        clearTimeout(messageHideTimer);
+        messageHideTimer = null;
+    }
+
+    messageBanner.hidden = false;
+    messageBanner.className = `message-banner ${type}`;
+    messageBanner.textContent = message;
+
+    messageHideTimer = setTimeout(() => {
+        messageBanner.hidden = true;
+        messageBanner.textContent = '';
+    }, type === 'error' ? 6500 : 4200);
 }
 
 // ============= Queue Management Functions =============
 
 async function addFilesToQueue() {
-    const result = await ipcRenderer.invoke('select-images');
+    const result = await api.selectImages();
     
     if (result.success && result.filePaths.length > 0) {
         await addToQueue(result.filePaths);
@@ -1148,38 +1427,33 @@ async function addFilesToQueue() {
 }
 
 async function addFolderToQueue() {
-    const result = await ipcRenderer.invoke('select-folder');
+    const result = await api.selectFolder();
     
     if (result.success) {
-        // Get all supported files from folder
-        const fs = require('fs');
-        
-        try {
-            const files = fs.readdirSync(result.folderPath);
-            const inputExts = ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.pdf'];
-            const imagePaths = files
-                .filter(file => inputExts.includes(path.extname(file).toLowerCase()))
-                .map(file => path.join(result.folderPath, file));
-            
-            if (imagePaths.length > 0) {
-                await addToQueue(imagePaths);
-            } else {
-                showMessage('No image/PDF files found in folder', 'warning');
-            }
-        } catch (error) {
-            showMessage(`Error reading folder: ${error.message}`, 'error');
+        const listResult = await api.listFolderInputs(result.folderPath);
+        if (!listResult.success) {
+            showMessage(`Error reading folder: ${listResult.error}`, 'error');
+            return;
+        }
+
+        if (listResult.filePaths.length > 0) {
+            await addToQueue(listResult.filePaths);
+        } else {
+            showMessage('No image/PDF files found in folder', 'warning');
         }
     }
 }
 
 async function addToQueue(filePaths) {
     try {
-        const result = await ipcRenderer.invoke('add-to-queue', {
+        const pageRange = sanitizePageRangeInput(pdfPageRange?.value || '');
+        const result = await api.addToQueue({
             filePaths,
             promptType: promptType.value,
             baseSize: parseInt(baseSize.value),
             imageSize: parseInt(imageSize.value),
-            cropMode: cropMode.checked
+            cropMode: cropMode.checked,
+            pdfPageRange: pageRange
         });
         
         if (result.success) {
@@ -1195,11 +1469,16 @@ async function addToQueue(filePaths) {
 
 async function updateQueueDisplay() {
     try {
-        const result = await ipcRenderer.invoke('get-queue-status');
+        const result = await api.getQueueStatus();
         
         if (result.success) {
             const queueData = result.data;
             queueItems = queueData.items || [];
+            const queueIsActive = Boolean(queueData.is_processing || queueData.processing > 0);
+            const queuePaused = Boolean(queueData.paused);
+            if (queueData.cancel_requested) {
+                progressStatus.textContent = 'Cancellation requested...';
+            }
             
             // Update queue count
             queueCount.textContent = queueData.total;
@@ -1215,9 +1494,18 @@ async function updateQueueDisplay() {
                     const itemEl = createQueueItemElement(item);
                     queueList.appendChild(itemEl);
                 });
-                processQueueBtn.disabled = isQueueProcessing || queueData.pending === 0;
-                clearQueueBtn.disabled = isQueueProcessing;
+                processQueueBtn.disabled = queueIsActive || queueData.pending === 0;
+                clearQueueBtn.disabled = queueIsActive;
             }
+
+            pauseQueueBtn.disabled = !queueIsActive || queuePaused;
+            resumeQueueBtn.disabled = !queueIsActive || !queuePaused;
+            cancelQueueBtn.disabled = !queueIsActive;
+            retryFailedBtn.disabled = queueIsActive || !queueData.can_retry_failed;
+            resumeQueueBtn.style.display = queuePaused ? 'inline-block' : 'none';
+            pauseQueueBtn.style.display = queuePaused ? 'none' : 'inline-block';
+            addFilesBtn.disabled = queueIsActive;
+            addFolderBtn.disabled = queueIsActive;
             
             // Update progress
             const totalFiles = queueData.total;
@@ -1228,13 +1516,14 @@ async function updateQueueDisplay() {
             const weightedCompleted = completedFiles + processingProgress;
             const activeItem = queueItems.find((item) => item.status === 'processing');
             const activeText = activeItem ? ` (active ${clampPercent(activeItem.progress)}%)` : '';
-            queueProgressText.textContent = `${completedFiles}/${totalFiles}${activeText}`;
+            const pausedText = queuePaused ? ' (paused)' : '';
+            queueProgressText.textContent = `${completedFiles}/${totalFiles}${activeText}${pausedText}`;
             
             if (totalFiles > 0) {
                 const progressPercent = (weightedCompleted / totalFiles) * 100;
-                queueProgressBar.style.width = `${progressPercent}%`;
+                setProgressBarWidth(queueProgressBar, progressPercent);
             } else {
-                queueProgressBar.style.width = '0%';
+                setProgressBarWidth(queueProgressBar, 0);
             }
         }
     } catch (error) {
@@ -1298,12 +1587,12 @@ async function processQueue() {
         isQueueProcessing = true;
         processQueueBtn.disabled = true;
         processQueueBtn.textContent = 'Processing...';
-        clearQueueBtn.disabled = true;
-        addFilesBtn.disabled = true;
-        addFolderBtn.disabled = true;
+        pauseQueueBtn.disabled = false;
+        cancelQueueBtn.disabled = false;
         
         // Reset preview for queue processing
-        ocrPreviewImage.src = '';
+        ocrPreviewImage.removeAttribute('src');
+        ocrPreviewImage.style.display = 'none';
         ocrBoxesOverlay.innerHTML = '';
         ocrBoxesOverlay.removeAttribute('viewBox');
         lastBoxCount = 0;
@@ -1319,13 +1608,16 @@ async function processQueue() {
         progressStatus.textContent = 'Starting queue processing (model will auto-load if needed)...';
         
         // Start queue processing
-        const result = await ipcRenderer.invoke('process-queue');
+        const result = await api.processQueue();
         
         // Stop polling
         stopQueuePolling();
         
         if (result.success) {
             currentQueueFolder = result.data.queue_folder;
+            const canceledNotice = result.data.canceled
+                ? '<p style="margin: 5px 0; color: #9a3412;"><strong>Canceled:</strong> Yes (remaining pending items were left in queue)</p>'
+                : '';
             
             // Show completion message in results panel
             const completedMsg = `
@@ -1334,6 +1626,7 @@ async function processQueue() {
                     <p style="margin: 5px 0;"><strong>Total Files:</strong> ${result.data.total}</p>
                     <p style="margin: 5px 0;"><strong>Completed:</strong> ${result.data.completed}</p>
                     <p style="margin: 5px 0;"><strong>Failed:</strong> ${result.data.failed}</p>
+                    ${canceledNotice}
                     <p style="margin: 15px 0 5px 0;"><strong>Results Location:</strong></p>
                     <code style="background: #dcfce7; padding: 8px; border-radius: 4px; display: block; word-break: break-all; font-size: 12px;">${currentQueueFolder}</code>
                     <p style="margin: 15px 0 0 0; font-size: 14px;">Click "Open Output Folder" button to view all results →</p>
@@ -1358,8 +1651,9 @@ async function processQueue() {
     } finally {
         isQueueProcessing = false;
         processQueueBtn.textContent = 'Process Queue';
-        addFilesBtn.disabled = false;
-        addFolderBtn.disabled = false;
+        pauseQueueBtn.disabled = true;
+        resumeQueueBtn.disabled = true;
+        cancelQueueBtn.disabled = true;
         await updateQueueDisplay();
     }
 }
@@ -1385,8 +1679,11 @@ function startQueuePolling() {
                     progressStatus.textContent = `Loading model ${percent}% before processing queue...`;
                 } else if (progressData.status === 'processing') {
                     // Update preview with current file if available
-                    const queueStatusResult = await fetch('http://127.0.0.1:5000/queue/status');
-                    const queueData = await queueStatusResult.json();
+                    const queueStatusResult = await api.getQueueStatus();
+                    if (!queueStatusResult.success) {
+                        throw new Error(queueStatusResult.error || 'Failed to fetch queue status');
+                    }
+                    const queueData = queueStatusResult.data;
 
                     if (progressData.message) {
                         progressStatus.textContent = progressData.message;
@@ -1415,12 +1712,24 @@ function startQueuePolling() {
                             resultsContent.innerHTML = `<p>Processing ${queueData.current_file.filename}${detail}...</p>`;
                             
                             // Load new file image
-                            ocrPreviewImage.src = previewPath;
-                            
+                            ocrPreviewImage.style.display = 'none';
+
                             // Wait for image to load
                             await new Promise((resolve) => {
-                                ocrPreviewImage.onload = resolve;
-                                setTimeout(resolve, 1000);
+                                let settled = false;
+                                const finalize = () => {
+                                    if (ocrPreviewImage.naturalWidth > 0 && ocrPreviewImage.naturalHeight > 0) {
+                                        ocrPreviewImage.style.display = 'block';
+                                    }
+                                    if (!settled) {
+                                        settled = true;
+                                        resolve();
+                                    }
+                                };
+                                ocrPreviewImage.onload = finalize;
+                                ocrPreviewImage.onerror = finalize;
+                                ocrPreviewImage.src = previewPath;
+                                setTimeout(finalize, 1000);
                             });
                         }
                         
@@ -1460,6 +1769,50 @@ function stopQueuePolling() {
     }
 }
 
+async function pauseQueue() {
+    const result = await api.pauseQueue();
+    if (!result.success) {
+        showMessage(`Failed to pause queue: ${result.error}`, 'error');
+        return;
+    }
+    progressStatus.textContent = 'Queue paused';
+    await updateQueueDisplay();
+}
+
+async function resumeQueue() {
+    const result = await api.resumeQueue();
+    if (!result.success) {
+        showMessage(`Failed to resume queue: ${result.error}`, 'error');
+        return;
+    }
+    progressStatus.textContent = 'Queue resumed';
+    await updateQueueDisplay();
+}
+
+async function cancelQueue() {
+    if (!confirm('Cancel queue processing after the current step?')) {
+        return;
+    }
+    const result = await api.cancelQueue();
+    if (!result.success) {
+        showMessage(`Failed to cancel queue: ${result.error}`, 'error');
+        return;
+    }
+    progressStatus.textContent = 'Queue cancellation requested...';
+    await updateQueueDisplay();
+}
+
+async function retryFailedQueueItems() {
+    const result = await api.retryFailedQueue();
+    if (!result.success) {
+        showMessage(`Retry failed: ${result.error}`, 'error');
+        return;
+    }
+    const retriedCount = Number(result.data?.retried || 0);
+    showMessage(`Moved ${retriedCount} failed item(s) back to pending`, 'success');
+    await updateQueueDisplay();
+}
+
 async function clearQueue() {
     if (isQueueProcessing) return;
     
@@ -1468,7 +1821,7 @@ async function clearQueue() {
     }
     
     try {
-        const result = await ipcRenderer.invoke('clear-queue');
+        const result = await api.clearQueue();
         
         if (result.success) {
             showMessage('Queue cleared', 'success');
@@ -1483,7 +1836,7 @@ async function clearQueue() {
 
 async function removeFromQueue(itemId) {
     try {
-        const result = await ipcRenderer.invoke('remove-from-queue', itemId);
+        const result = await api.removeFromQueue(itemId);
         
         if (result.success) {
             await updateQueueDisplay();
@@ -1497,7 +1850,7 @@ async function removeFromQueue(itemId) {
 
 async function openOutputFolder() {
     if (currentQueueFolder) {
-        await ipcRenderer.invoke('open-folder', currentQueueFolder);
+        await api.openFolder(currentQueueFolder);
     }
 }
 

@@ -65,12 +65,26 @@ function removeDirQuietly(dirPath) {
 }
 
 async function invokeIpc(window, channel, payload) {
+  const channelToMethod = {
+    'load-model': 'loadModel',
+    'perform-ocr': 'performOCR',
+    'add-to-queue': 'addToQueue',
+    'process-queue': 'processQueue',
+    'get-queue-status': 'getQueueStatus'
+  };
+  const methodName = channelToMethod[channel];
+  if (!methodName) {
+    throw new Error(`Unsupported channel in E2E helper: ${channel}`);
+  }
+
   return window.evaluate(
-    async ({ channelName, channelPayload }) => {
-      const { ipcRenderer } = require('electron');
-      return ipcRenderer.invoke(channelName, channelPayload);
+    async ({ apiMethod, channelPayload }) => {
+      if (!window.appAPI || typeof window.appAPI[apiMethod] !== 'function') {
+        throw new Error(`appAPI method not found: ${apiMethod}`);
+      }
+      return window.appAPI[apiMethod](channelPayload);
     },
-    { channelName: channel, channelPayload: payload }
+    { apiMethod: methodName, channelPayload: payload }
   );
 }
 
