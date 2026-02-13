@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, dialog, shell } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, shell, session } = require('electron');
 const path = require('path');
 const { spawn, spawnSync } = require('child_process');
 const fs = require('fs');
@@ -776,6 +776,21 @@ function createWindow() {
       sandbox: false
     },
     icon: path.join(__dirname, 'assets', 'icon.png')
+  });
+
+  // Set Content-Security-Policy via response headers (instead of HTML meta tag)
+  // to avoid false-positive AV heuristic matches on the HTML file.
+  session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
+    callback({
+      responseHeaders: {
+        ...details.responseHeaders,
+        'Content-Security-Policy': [
+          "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; " +
+          `img-src 'self' data: blob: ${PYTHON_SERVER_URL}; ` +
+          `connect-src 'self' ${PYTHON_SERVER_URL};`
+        ]
+      }
+    });
   });
 
   mainWindow.loadFile('index.html');

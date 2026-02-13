@@ -112,6 +112,7 @@ progress_data = {
     'progress_percent': 0,  # 0-100
     'chars_generated': 0,  # For OCR character counting
     'raw_token_stream': '',  # Accumulated raw tokens during OCR
+    'current_page_image': '',  # Path to current PDF page image being processed
     'timestamp': time.time()
 }
 progress_lock = Lock()
@@ -125,7 +126,7 @@ progress_log_state = {
     'logged_at': 0.0
 }
 
-def update_progress(status, stage='', message='', progress_percent=0, chars_generated=0, raw_token_stream=''):
+def update_progress(status, stage='', message='', progress_percent=0, chars_generated=0, raw_token_stream='', current_page_image=''):
     """Update the global progress data"""
     global progress_data, progress_log_state
     with progress_lock:
@@ -135,6 +136,10 @@ def update_progress(status, stage='', message='', progress_percent=0, chars_gene
         progress_data['progress_percent'] = progress_percent
         progress_data['chars_generated'] = chars_generated
         progress_data['raw_token_stream'] = raw_token_stream
+        if current_page_image:
+            progress_data['current_page_image'] = current_page_image
+        elif stage != 'ocr' or status != 'processing':
+            progress_data['current_page_image'] = ''
         progress_data['timestamp'] = time.time()
         # Throttle verbose progress logs to reduce overhead while streaming.
         now = progress_data['timestamp']
@@ -1140,7 +1145,8 @@ def perform_ocr():
                         'ocr',
                         f'Processing PDF page {page_label} ({page_idx}/{total_pages})...',
                         int(((page_idx - 1) / total_pages) * 95),
-                        0
+                        0,
+                        current_page_image=page_image
                     )
                     clear_output_artifacts(OUTPUT_DIR)
                     page_progress = int(((page_idx - 1) / total_pages) * 95)
@@ -1873,6 +1879,17 @@ def remove_from_queue(item_id):
 def diagnostics():
     """Return backend diagnostics payload for support bundles."""
     return jsonify(collect_runtime_diagnostics())
+
+@app.route('/current_page_image', methods=['GET'])
+def serve_current_page_image():
+    """Serve the current PDF page image being processed"""
+    with progress_lock:
+        image_path = progress_data.get('current_page_image', '')
+    if not image_path or not os.path.isfile(image_path):
+        return '', 404
+    directory = os.path.dirname(os.path.abspath(image_path))
+    filename = os.path.basename(image_path)
+    return send_from_directory(directory, filename)
 
 @app.route('/outputs/<path:filename>', methods=['GET'])
 def serve_output_file(filename):

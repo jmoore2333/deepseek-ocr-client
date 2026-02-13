@@ -1131,26 +1131,30 @@ async function performOCR() {
         ocrBoxesOverlay.removeAttribute('viewBox');
 
         // Load image into preview and get dimensions
+        const isCurrentPdf = isPdfPath(currentImagePath);
         ocrPreviewImage.style.display = 'none';
-        await new Promise((resolve) => {
-            let settled = false;
-            const finalize = () => {
-                imageNaturalWidth = ocrPreviewImage.naturalWidth;
-                imageNaturalHeight = ocrPreviewImage.naturalHeight;
-                console.log(`Image dimensions: ${imageNaturalWidth}×${imageNaturalHeight}`);
-                if (imageNaturalWidth > 0 && imageNaturalHeight > 0) {
-                    ocrPreviewImage.style.display = 'block';
-                }
-                if (!settled) {
-                    settled = true;
-                    resolve();
-                }
-            };
-            ocrPreviewImage.onload = finalize;
-            ocrPreviewImage.onerror = finalize;
-            ocrPreviewImage.src = currentImagePath;
-            setTimeout(finalize, 2000);
-        });
+        if (!isCurrentPdf) {
+            await new Promise((resolve) => {
+                let settled = false;
+                const finalize = () => {
+                    imageNaturalWidth = ocrPreviewImage.naturalWidth;
+                    imageNaturalHeight = ocrPreviewImage.naturalHeight;
+                    console.log(`Image dimensions: ${imageNaturalWidth}×${imageNaturalHeight}`);
+                    if (imageNaturalWidth > 0 && imageNaturalHeight > 0) {
+                        ocrPreviewImage.style.display = 'block';
+                    }
+                    if (!settled) {
+                        settled = true;
+                        resolve();
+                    }
+                };
+                ocrPreviewImage.onload = finalize;
+                ocrPreviewImage.onerror = finalize;
+                ocrPreviewImage.src = currentImagePath;
+                setTimeout(finalize, 2000);
+            });
+        }
+        let lastPdfPageUrl = null;
 
         // Poll for token count and raw token stream updates
         tokenPollInterval = setInterval(async () => {
@@ -1176,6 +1180,34 @@ async function performOCR() {
                             : `${data.message} (${elapsedSeconds}s)`;
                     } else {
                         progressStatus.textContent = `Processing OCR... (${elapsedSeconds}s)`;
+                    }
+
+                    // For PDFs, load the current rendered page image into the preview stage
+                    if (isCurrentPdf && data.current_page_image) {
+                        const pageImageUrl = `http://127.0.0.1:5000/current_page_image?t=${Date.now()}`;
+                        if (lastPdfPageUrl !== data.current_page_image) {
+                            lastPdfPageUrl = data.current_page_image;
+                            // New page - reset boxes and load the page image
+                            ocrBoxesOverlay.innerHTML = '';
+                            ocrBoxesOverlay.removeAttribute('viewBox');
+                            lastBoxCount = 0;
+                            ocrPreviewImage.style.display = 'none';
+                            await new Promise((resolve) => {
+                                let settled = false;
+                                const finalize = () => {
+                                    imageNaturalWidth = ocrPreviewImage.naturalWidth;
+                                    imageNaturalHeight = ocrPreviewImage.naturalHeight;
+                                    if (imageNaturalWidth > 0 && imageNaturalHeight > 0) {
+                                        ocrPreviewImage.style.display = 'block';
+                                    }
+                                    if (!settled) { settled = true; resolve(); }
+                                };
+                                ocrPreviewImage.onload = finalize;
+                                ocrPreviewImage.onerror = finalize;
+                                ocrPreviewImage.src = pageImageUrl;
+                                setTimeout(finalize, 2000);
+                            });
+                        }
                     }
 
                     // Parse and render boxes from raw token stream
