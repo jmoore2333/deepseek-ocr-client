@@ -54,3 +54,6 @@ dist/
 # Bundled runtime binaries (downloaded at build time)
 runtime/uv
 runtime/uv.exe
+
+# Archives
+*.zip
