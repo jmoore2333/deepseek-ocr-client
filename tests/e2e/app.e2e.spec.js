@@ -90,8 +90,27 @@ async function invokeIpc(window, channel, payload) {
 
 async function waitForConnected(window) {
   await expect
-    .poll(() =>
-      window.evaluate(() => document.getElementById('server-status')?.textContent || '')
+    .poll(
+      async () =>
+        window.evaluate(async () => {
+          const statusResult = await window.appAPI.checkServerStatus();
+          const startupStatus = await window.appAPI.getStartupStatus();
+          return {
+            connected: Boolean(statusResult?.success),
+            error: statusResult?.error || '',
+            startupState: startupStatus?.state || 'unknown',
+            startupMessage: startupStatus?.message || '',
+            label: document.getElementById('server-status')?.textContent || ''
+          };
+        }),
+      { timeout: 50000 }
+    )
+    .toMatchObject({ connected: true });
+
+  await expect
+    .poll(
+      () => window.evaluate(() => document.getElementById('server-status')?.textContent || ''),
+      { timeout: 10000 }
     )
     .toContain('Connected');
 }
