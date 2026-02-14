@@ -223,9 +223,7 @@ def get_preferred_model_name():
         return os.environ['MODEL_NAME']
     if RUNTIME_BACKEND == 'mlx':
         return 'mlx-community/DeepSeek-OCR-2-8bit'
-    if get_preferred_device() == 'cuda':
-        return 'deepseek-ai/DeepSeek-OCR'
-    return 'Dogacel/DeepSeek-OCR-Metal-MPS'
+    return 'deepseek-ai/DeepSeek-OCR-2'
 
 
 MODEL_NAME = get_preferred_model_name()

@@ -1,232 +1,140 @@
-# DeepSeek OCR — MCP Server & Claude Code Plugin
+# DeepSeek OCR MCP Server
 
 ## What It Does
 
-The MCP (Model Context Protocol) server gives Claude Code (or any MCP-compatible LLM client) full programmatic control over the DeepSeek OCR desktop application. Everything you can do in the GUI, you can do through the MCP server:
+The MCP (Model Context Protocol) server in `backend/mcp_server.py` exposes the same OCR backend used by the Electron UI. Any MCP-compatible client can:
 
-- Submit images and PDFs for OCR
-- Manage the processing queue (add, pause, resume, cancel, retry, clear)
-- Monitor progress in real time
-- Load/check model status
+- Run OCR for images and PDFs
+- Manage queue workflows (add/start/pause/resume/cancel/retry/clear)
+- Check health/progress/model info
+- Trigger model load
 - Export diagnostics
 - Manage retention policy
-- Run preflight checks
-
-The server wraps the same Flask HTTP API that the Electron UI uses, so behavior is identical to using the desktop app directly.
 
 ## Architecture
 
-```
-Claude Code ──stdio──> MCP Server (mcp_server.py)
-                            │
-                       HTTP (localhost:5000)
-                            │
-                       Flask Backend (ocr_server.py)
-                            │
-                       PyTorch Model (CUDA/MPS/CPU)
-```
-
-The MCP server is a Python process that communicates with the Flask backend over HTTP. It uses stdio transport so Claude Code can spawn it as a subprocess. The Flask backend must be running — either through the Electron desktop app or started manually.
-
-## Installation
-
-### Option A: Project-Level `.mcp.json` (Recommended)
-
-The project includes a `.mcp.json` at the root that Claude Code auto-discovers when you open the project directory. No manual installation needed.
-
-First, set up the Python environment:
-
-```bash
-# Create a venv and install MCP dependencies
-uv venv venv --python 3.11
-uv pip install --python venv/bin/python3 "mcp[cli]>=1.0.0" "httpx>=0.27.0"
-```
-
-The `.mcp.json` points to `venv/bin/python3` so the MCP server uses this venv. When you start a new Claude Code session in this project, the MCP server will be available automatically.
-
-### Option B: CLI Registration
-
-```bash
-claude mcp add --transport stdio --scope project deepseek-ocr -- venv/bin/python3 backend/mcp_server.py
-```
-
-### Option C: Plugin with Skills
-
-The `mcp-plugin/` directory contains a Claude Code plugin with three workflow skills. To test locally:
-
-```bash
-claude --plugin-dir ./mcp-plugin
-```
-
-Skills provided:
-- `/deepseek-ocr:ocr-single-file` — Process a single image or PDF
-- `/deepseek-ocr:ocr-batch-folder` — Batch process a folder of files
-- `/deepseek-ocr:system-check` — Full system diagnostic
-
-### Option D: Manual MCP Configuration
-```
-
-This activates automatically when you open Claude Code in the project directory.
-
-### Option C: Manual MCP Configuration
-
-Add to your Claude Code settings (`~/.claude/settings.json`) under `mcpServers`:
-
-```json
-{
-  "mcpServers": {
-    "deepseek-ocr": {
-      "command": "python",
-      "args": ["/absolute/path/to/deepseek-ocr-client/backend/mcp_server.py"],
-      "env": {
-        "DEEPSEEK_OCR_URL": "http://127.0.0.1:5000"
-      }
-    }
-  }
-}
-```
-
-### Dependencies
-
-The MCP server requires two additional Python packages (already in `requirements.txt`):
-
-```
-mcp[cli]>=1.0.0
-httpx>=0.27.0
-```
-
-If using the app's managed Python environment, these install automatically. For development:
-
-```bash
-pip install "mcp[cli]>=1.0.0" "httpx>=0.27.0"
+```text
+MCP Client (Codex / Claude / other)
+            │ stdio
+            ▼
+MCP Server (backend/mcp_server.py)
+            │ HTTP (DEEPSEEK_OCR_URL)
+            ▼
+Flask Backend (backend/ocr_server.py)
+            │
+            ├─ Apple Silicon: MLX backend + mlx-community/DeepSeek-OCR-2-8bit
+            └─ CUDA/CPU: PyTorch backend + deepseek-ai/DeepSeek-OCR-2
 ```
 
 ## Prerequisites
 
-The Flask backend must be running before using the MCP server. Two ways:
+- Flask backend running at `DEEPSEEK_OCR_URL` (default `http://127.0.0.1:5000`)
+- Python with MCP dependencies (`mcp[cli]`, `httpx`)
 
-1. **Open the desktop app** — the Electron app starts the Flask backend automatically
-2. **Start manually** — `python backend/ocr_server.py` (uses port 5000)
+Backend start options:
+
+1. Open the desktop app (recommended): backend is started automatically.
+2. Run manually: `python backend/ocr_server.py`.
+
+## Dependency Setup (Dev)
+
+```bash
+cd /absolute/path/to/deepseek-ocr-client
+uv venv venv --python 3.11
+uv pip install --python venv/bin/python3 "mcp[cli]>=1.0.0" "httpx>=0.27.0"
+```
+
+## Codex App / Codex CLI Setup
+
+No MCP server code changes are required for Codex. The only adjustments needed are:
+
+- Register the server in Codex MCP config
+- Use absolute paths for `command` and script args
+- Set `DEEPSEEK_OCR_URL` if your backend is not on `127.0.0.1:5000`
+
+### Option A: Register via CLI (recommended)
+
+```bash
+cd /absolute/path/to/deepseek-ocr-client
+codex mcp add deepseek-ocr --env DEEPSEEK_OCR_URL=http://127.0.0.1:5000 -- \
+  "$(pwd)/venv/bin/python3" "$(pwd)/backend/mcp_server.py"
+codex mcp list
+```
+
+### Option B: Manual `~/.codex/config.toml`
+
+```toml
+[mcp_servers.deepseek-ocr]
+command = "/absolute/path/to/deepseek-ocr-client/venv/bin/python3"
+args = ["/absolute/path/to/deepseek-ocr-client/backend/mcp_server.py"]
+
+[mcp_servers.deepseek-ocr.env]
+DEEPSEEK_OCR_URL = "http://127.0.0.1:5000"
+```
+
+After saving config, restart Codex App/CLI session and verify with `codex mcp list`.
+
+## Claude Code Setup
+
+- Project-local config exists at `.claude/mcp_servers.json`
+- Optional plugin exists at `mcp-plugin/`
+
+```bash
+claude plugin install --path ./mcp-plugin
+```
+
+## Project Config Files
+
+- `.mcp.json`: generic MCP server config (project-local)
+- `.claude/mcp_servers.json`: Claude project config
+- `mcp-plugin/.mcp.json`: plugin-scoped MCP config
 
 ## Available Tools
 
-Tools are actions that change state or perform work.
-
 | Tool | Description |
-|------|-------------|
-| `ocr_process_file` | Submit a single image or PDF for OCR. Args: `file_path`, `prompt_type`, `base_size`, `image_size`, `crop_mode`, `pdf_page_range` |
-| `queue_add_files` | Add files to the processing queue. Args: `file_paths` (list), same OCR params |
-| `queue_start_processing` | Start queue processing (non-blocking, returns immediately) |
-| `queue_wait_for_completion` | Block until queue finishes. Args: `timeout_seconds`, `poll_interval` |
-| `queue_pause` | Pause active queue processing |
-| `queue_resume` | Resume paused queue processing |
-| `queue_cancel` | Cancel active queue processing |
-| `queue_retry_failed` | Reset failed items to pending for retry |
-| `queue_clear` | Clear all items from queue |
-| `queue_remove_item` | Remove a specific item. Args: `item_id` |
-| `model_load` | Trigger model download/loading |
-| `retention_policy_update` | Update cleanup settings. Args: `output_retention_days`, `max_queue_runs`, etc. |
-| `retention_cleanup_run` | Run retention cleanup immediately |
-| `diagnostics_export` | Export diagnostics to file or return inline. Args: `output_path` (optional) |
+|---|---|
+| `ocr_process_file` | OCR a single image/PDF (`file_path`, `prompt_type`, `base_size`, `image_size`, `crop_mode`, `pdf_page_range`) |
+| `queue_add_files` | Add files to queue |
+| `queue_start_processing` | Start queue processing |
+| `queue_wait_for_completion` | Wait for queue completion |
+| `queue_pause` | Pause queue |
+| `queue_resume` | Resume queue |
+| `queue_cancel` | Cancel queue |
+| `queue_retry_failed` | Retry failed queue items |
+| `queue_clear` | Clear queue |
+| `queue_remove_item` | Remove queue item by ID |
+| `model_load` | Load/download model |
+| `retention_policy_update` | Update retention settings |
+| `retention_cleanup_run` | Trigger cleanup now |
+| `diagnostics_export` | Export diagnostics (inline or to file) |
 
 ## Available Resources
 
-Resources are read-only data you can inspect.
-
 | URI | Description |
-|-----|-------------|
-| `deepseek-ocr://health` | Backend health: model status, device, GPU availability |
-| `deepseek-ocr://progress` | Current operation progress (loading, processing, idle) |
-| `deepseek-ocr://model-info` | Model name, cache dir, device, GPU name |
-| `deepseek-ocr://queue/status` | Full queue: total/pending/processing/completed/failed items |
+|---|---|
+| `deepseek-ocr://health` | Runtime health and backend/device state |
+| `deepseek-ocr://progress` | Current progress (loading/processing/idle) |
+| `deepseek-ocr://model-info` | Model name, cache, backend, device |
+| `deepseek-ocr://queue/status` | Queue summary and item-level status |
 | `deepseek-ocr://diagnostics` | Runtime diagnostics snapshot |
-| `deepseek-ocr://retention-policy` | Current retention/cleanup policy |
-| `deepseek-ocr://preflight` | Setup status, disk space, backend reachability |
-
-## Usage Examples
-
-### Single file OCR
-
-```
-> Use the deepseek-ocr MCP server to OCR this file: /Users/me/Documents/receipt.png
-```
-
-Claude Code will:
-1. Check health → load model if needed → call `ocr_process_file` → return text
-
-### Batch process a folder
-
-```
-> Process all the PDFs in /Users/me/Documents/scans/ with the OCR queue
-```
-
-Claude Code will:
-1. List files → `queue_add_files` → `queue_start_processing` → `queue_wait_for_completion` → report results
-
-### System check
-
-```
-> Run a system check on the DeepSeek OCR app
-```
-
-Or with the plugin skill:
-
-```
-> /deepseek-ocr:system-check
-```
-
-### Monitor queue progress
-
-```
-> What's the current status of the OCR queue?
-```
-
-Claude Code reads `deepseek-ocr://queue/status` and reports.
-
-## Configuration
-
-### Environment Variables
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `DEEPSEEK_OCR_URL` | `http://127.0.0.1:5000` | Flask backend URL |
-
-### Custom Flask Port
-
-If the Flask backend runs on a different port:
-
-```json
-{
-  "env": {
-    "DEEPSEEK_OCR_URL": "http://127.0.0.1:8080"
-  }
-}
-```
+| `deepseek-ocr://retention-policy` | Current retention policy |
+| `deepseek-ocr://preflight` | Setup/disk/download preflight report |
 
 ## Troubleshooting
 
-**"Flask backend not reachable"**
-- Start the desktop app, or run `python backend/ocr_server.py` manually
-- Check that port 5000 is not blocked by another process
+**Server not reachable / backend down**
 
-**"Model not loaded"**
-- Call `model_load` — first run downloads ~3-5 GB
-- Check `deepseek-ocr://progress` for download/loading status
+- Confirm app is open, or run `python backend/ocr_server.py`
+- Check `DEEPSEEK_OCR_URL` matches the backend URL/port
 
-**"Queue already processing"**
-- Only one queue run at a time. Use `queue_pause` or `queue_cancel` first.
+**MCP server fails to start**
 
-**MCP server won't start**
-- Ensure `mcp` and `httpx` are installed: `pip install "mcp[cli]" httpx`
-- Verify Python syntax: `python -m py_compile backend/mcp_server.py`
+- Verify dependencies: `pip install "mcp[cli]" httpx`
+- Validate script: `python -m py_compile backend/mcp_server.py`
+- Re-add server with absolute paths
 
-## File Locations
+**Model not loaded**
 
-| File | Purpose |
-|------|---------|
-| `backend/mcp_server.py` | MCP server implementation (605 lines) |
-| `mcp-plugin/` | Claude Code plugin package |
-| `mcp-plugin/.claude-plugin/plugin.json` | Plugin manifest |
-| `mcp-plugin/.mcp.json` | Plugin MCP server config |
-| `mcp-plugin/skills/` | Plugin skills (OCR, batch, diagnostics) |
-| `.claude/mcp_servers.json` | Project-level MCP config (auto-activates) |
+- Call `model_load`
+- Poll `deepseek-ocr://progress` until `status=loaded`
+

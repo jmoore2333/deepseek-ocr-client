@@ -10,7 +10,7 @@ This project is unaffiliated with DeepSeek.
 - Hardware-aware setup path (Apple Silicon MLX, NVIDIA CUDA, CPU)
 - Dual inference backends:
   - Apple Silicon: `mlx` + `mlx-vlm` with `mlx-community/DeepSeek-OCR-2-8bit`
-  - Windows/Linux/Intel macOS: PyTorch backend (`torch` + `transformers`)
+  - Windows/Linux/Intel macOS: PyTorch backend (`torch` + `transformers`) with `deepseek-ai/DeepSeek-OCR-2`
 - Queue processing for mixed image + PDF inputs
 - Queue controls: pause, resume, cancel, retry failed
 - PDF page-range support (`1-3,5`) for single OCR and queue OCR
@@ -67,6 +67,12 @@ start-client.bat
 1. Click `Load Model` (first time downloads model)
 2. Drop/select an image or PDF
 3. Click `Run OCR`
+
+### Default model routing
+
+- Apple Silicon (MLX backend): `mlx-community/DeepSeek-OCR-2-8bit`
+- CUDA + CPU (PyTorch backend): `deepseek-ai/DeepSeek-OCR-2`
+- Override on any platform via `MODEL_NAME`
 
 ## Queue Workflow
 
@@ -155,19 +161,25 @@ Renderer access is exposed through a restricted preload API:
 - `nodeIntegration: false`
 - IPC channels wrapped by explicit preload methods
 
-## MCP Server / Claude Code Plugin
+## MCP Server (Codex/Claude/Any MCP Client)
 
-This project includes an MCP (Model Context Protocol) server that enables full programmatic control of the OCR application through Claude Code or any MCP-compatible LLM client.
+This project includes an MCP (Model Context Protocol) server at `backend/mcp_server.py` that can drive the same OCR flows as the UI: single-file OCR, queue control, model loading, diagnostics, and retention management.
 
-**What you can do:** Submit files for OCR, manage the processing queue, monitor progress, load models, export diagnostics, and manage retention — all through natural language in Claude Code.
-
-**Quick start:** The project-level config at `.claude/mcp_servers.json` activates automatically when you open Claude Code in this directory. Or install the plugin:
+**Codex App / Codex CLI quick start**
 
 ```bash
-claude plugin install --path ./mcp-plugin
+cd /absolute/path/to/deepseek-ocr-client
+codex mcp add deepseek-ocr --env DEEPSEEK_OCR_URL=http://127.0.0.1:5000 -- \
+  "$(pwd)/venv/bin/python3" "$(pwd)/backend/mcp_server.py"
+codex mcp list
 ```
 
-See [`docs/mcp-server.md`](docs/mcp-server.md) for full documentation, available tools/resources, and usage examples.
+**Claude Code quick start**
+
+- Project config: `.claude/mcp_servers.json`
+- Optional plugin: `claude plugin install --path ./mcp-plugin`
+
+See [`docs/mcp-server.md`](docs/mcp-server.md) for full setup details, including Codex config snippets and troubleshooting.
 
 ## Project Layout
 
