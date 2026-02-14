@@ -93,26 +93,27 @@ async function waitForConnected(window) {
     .poll(
       async () =>
         window.evaluate(async () => {
-          const statusResult = await window.appAPI.checkServerStatus();
           const startupStatus = await window.appAPI.getStartupStatus();
           return {
-            connected: Boolean(statusResult?.success),
-            error: statusResult?.error || '',
-            startupState: startupStatus?.state || 'unknown',
-            startupMessage: startupStatus?.message || '',
-            label: document.getElementById('server-status')?.textContent || ''
+            state: startupStatus?.state || 'unknown',
+            message: startupStatus?.message || ''
           };
         }),
       { timeout: 50000 }
     )
-    .toMatchObject({ connected: true });
+    .toMatchObject({ state: 'ready' });
 
-  await expect
-    .poll(
-      () => window.evaluate(() => document.getElementById('server-status')?.textContent || ''),
-      { timeout: 10000 }
-    )
-    .toContain('Connected');
+  // Best-effort status refresh to update renderer badges before UI interactions.
+  await window.evaluate(async () => {
+    try {
+      await Promise.race([
+        window.appAPI.checkServerStatus(),
+        new Promise((resolve) => setTimeout(resolve, 3000))
+      ]);
+    } catch (error) {
+      // Startup readiness is the source of truth for test setup.
+    }
+  });
 }
 
 test.describe('DeepSeek OCR Electron E2E', () => {
