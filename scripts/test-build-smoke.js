@@ -17,12 +17,21 @@ function run(command, args, options = {}) {
     },
     ...options
   });
+  if (result.error) {
+    console.error(`[build-smoke] Failed to execute ${command}: ${result.error.message}`);
+    process.exit(1);
+  }
   if (result.status !== 0) {
     process.exit(result.status || 1);
   }
 }
 
-function getNpxCommand() {
+function getElectronBuilderCommand() {
+  const binName = process.platform === 'win32' ? 'electron-builder.cmd' : 'electron-builder';
+  const localBin = path.join(projectRoot, 'node_modules', '.bin', binName);
+  if (fs.existsSync(localBin)) {
+    return localBin;
+  }
   return process.platform === 'win32' ? 'npx.cmd' : 'npx';
 }
 
@@ -53,6 +62,10 @@ function assertUnpackedArtifact() {
 }
 
 console.log('[build-smoke] Running electron-builder --dir for current host platform...');
-run(getNpxCommand(), ['electron-builder', '--dir', '--publish', 'never', getPlatformFlag()]);
+const builderCommand = getElectronBuilderCommand();
+const builderArgs = builderCommand.endsWith('npx') || builderCommand.endsWith('npx.cmd')
+  ? ['electron-builder', '--dir', '--publish', 'never', getPlatformFlag()]
+  : ['--dir', '--publish', 'never', getPlatformFlag()];
+run(builderCommand, builderArgs);
 assertUnpackedArtifact();
 console.log('[build-smoke] Build smoke test passed.');

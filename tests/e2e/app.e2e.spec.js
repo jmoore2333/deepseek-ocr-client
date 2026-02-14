@@ -103,14 +103,18 @@ test.describe('DeepSeek OCR Electron E2E', () => {
 
   test.beforeEach(async () => {
     fixtures = createFixtures();
+    const launchEnv = {
+      ...process.env,
+      DEEPSEEK_MOCK_BACKEND: '1',
+      ELECTRON_DISABLE_SECURITY_WARNINGS: 'true'
+    };
+    // Some CI environments leak this variable, which makes Electron exit as Node.
+    delete launchEnv.ELECTRON_RUN_AS_NODE;
+
     electronApp = await electron.launch({
       args: [APP_ROOT],
       cwd: APP_ROOT,
-      env: {
-        ...process.env,
-        DEEPSEEK_MOCK_BACKEND: '1',
-        ELECTRON_DISABLE_SECURITY_WARNINGS: 'true'
-      }
+      env: launchEnv
     });
     window = await electronApp.firstWindow();
     await waitForConnected(window);
