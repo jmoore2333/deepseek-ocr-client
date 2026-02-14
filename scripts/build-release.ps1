@@ -67,7 +67,8 @@ if ($LASTEXITCODE -ne 0) {
 }
 Write-Host ""
 
-$Installer = Get-ChildItem -Path (Join-Path $ProjectRoot "dist") -Filter "*.exe" -File -ErrorAction SilentlyContinue | Select-Object -First 1
+$Installers = Get-ChildItem -Path (Join-Path $ProjectRoot "dist") -Filter "*.exe" -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending
+$Installer = $Installers | Select-Object -First 1
 
 Write-Host "=============================================="
 Write-Host "  Build Complete"
@@ -77,6 +78,9 @@ if ($Installer) {
     $SizeMB = [math]::Round($Installer.Length / 1MB, 1)
     Write-Host "Installer: $($Installer.FullName)"
     Write-Host "Size: $SizeMB MB"
+    if ($Installers.Count -gt 1) {
+        Write-Host "Note: Multiple installers found in dist/. Using newest by timestamp."
+    }
 } else {
     Write-Host "Installer not found in dist/. Check build logs."
 }
