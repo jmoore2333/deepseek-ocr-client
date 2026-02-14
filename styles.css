@@ -330,6 +330,11 @@ body[data-ui-mode="basic"] .advanced-only {
     padding-right: 2px;
 }
 
+.control-rail > .panel {
+    /* Prevent stacked panels from shrinking below their content height. */
+    flex: 0 0 auto;
+}
+
 .stage-panel {
     grid-area: stage;
 }
