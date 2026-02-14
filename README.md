@@ -152,6 +152,10 @@ npm run dist:linux
 - Setup stuck or failing:
   - Run `Run Preflight`
   - Check internet/disk availability
+- Windows build script behavior for `winCodeSign` symlink restrictions:
+  - `.\scripts\build-release.ps1` now auto-falls back to a compatibility build mode when the shell cannot create symlinks.
+  - Compatibility mode disables executable editing/signing (`signAndEditExecutable=false`), so installer output works but EXE icon/version metadata can differ.
+  - For full executable editing behavior, enable `Developer Mode` or run PowerShell as Administrator.
 - Model/runtime issues:
   - Use `Export Diagnostics`
   - Inspect `diagnostics.json` and log tails
