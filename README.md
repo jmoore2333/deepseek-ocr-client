@@ -1,124 +1,144 @@
-# DeepSeek OCR Client (Fork)
+# DeepSeek-OCR-2 Client
 
-Desktop Electron client for [DeepSeek-OCR](https://github.com/deepseek-ai/DeepSeek-OCR), with cross-platform packaging, queue workflows, GPU-aware setup, and first-run managed Python runtime.
+**A desktop OCR workspace for [DeepSeek-OCR-2](https://github.com/deepseek-ai/DeepSeek-OCR-2) with live overlay preview, queue processing, and automatic hardware-aware setup.**
 
 This project is unaffiliated with DeepSeek.
 
-## What This Fork Adds
+![DeepSeek-OCR-2 Client result overlay](docs/images/ui-ocr-result-overlay.png)
 
-- Managed first-run runtime via bundled `uv` (packaged builds)
-- Hardware-aware setup path (Apple Silicon MLX, NVIDIA CUDA, CPU)
-- Dual inference backends:
-  - Apple Silicon: `mlx` + `mlx-vlm` with `mlx-community/DeepSeek-OCR-2-8bit`
-  - Windows/Linux/Intel macOS: PyTorch backend (`torch` + `transformers`) with `deepseek-ai/DeepSeek-OCR-2`
-- Queue processing for mixed image + PDF inputs
-- Queue controls: pause, resume, cancel, retry failed
-- PDF page-range support (`1-3,5`) for single OCR and queue OCR
-- Startup/setup progress UI
-- Preflight estimator (disk + download/time estimates)
-- Diagnostics bundle export (for debugging/support)
-- Retention policy UI (outputs/cache cleanup)
-- Security hardening: preload-based API with `contextIsolation: true`
-- Cross-platform E2E and packaging test coverage
+## Why This Client
 
-## Platform Support
+If you want OCR that is:
+- local-first
+- fast on your available hardware
+- easy for non-technical users
+- still scriptable for advanced users
 
-- macOS: source mode + DMG packaging
-- Windows: source mode + NSIS packaging
-- Linux: source mode + AppImage/deb packaging
+this app is designed for that exact flow.
 
-## Requirements
+It gives you one desktop surface for:
+- image and PDF OCR
+- queue/batch processing
+- live detection overlays
+- setup diagnostics and retention controls
+- optional MCP control from Codex/CLI tooling
 
-### End users (installer builds)
+## Install (Simple Path)
 
-- No preinstalled Python required
-- Internet access on first run (runtime + dependencies + model)
+1. Open the [Releases page](https://github.com/jmoore2333/deepseek-ocr-client/releases).
+2. Download the installer for your platform.
+3. Launch the app.
+4. On first run, let setup finish (runtime + dependencies + model preparation).
 
-### Source/development mode
+## 3-Minute First OCR
+
+1. Start the app.
+2. Click `Load Model`.
+3. Drag in an image or PDF (or click `Select File`).
+4. Keep `Type = Document` unless you need a different mode.
+5. Click `Run OCR`.
+6. Review output in `Output Inspector`.
+7. Use `Copy to Clipboard` or `Download ZIP`.
+
+![Quick start panel](docs/images/ui-quickstart-basic.png)
+
+## Queue / Batch Workflow
+
+1. Use `Add Files` or `Add Folder`.
+2. Optional: set PDF page ranges (for example `1-3,5`).
+3. Click `Process Queue`.
+4. While running, you can `Pause`, `Cancel`, or `Retry Failed`.
+
+![Queue active state](docs/images/ui-queue-active.png)
+
+## Basic vs Advanced Mode
+
+- `Basic`: minimal controls for fast OCR.
+- `Advanced`: full tuning, preflight checks, diagnostics export, retention policy.
+
+![Dashboard (Basic)](docs/images/ui-dashboard-basic.png)
+![Dashboard (Advanced)](docs/images/ui-dashboard-advanced.png)
+
+## Hardware Backends and Models
+
+The app routes by platform automatically:
+
+| Platform / Device | Runtime Backend | Default Model |
+|---|---|---|
+| Apple Silicon (macOS arm64) | MLX (`mlx`, `mlx-vlm`) | [`mlx-community/DeepSeek-OCR-2-8bit`](https://huggingface.co/mlx-community/DeepSeek-OCR-2-8bit) |
+| NVIDIA CUDA (Windows/Linux) | PyTorch | [`deepseek-ai/DeepSeek-OCR-2`](https://huggingface.co/deepseek-ai/DeepSeek-OCR-2) |
+| CPU fallback (Windows/Linux/Intel macOS) | PyTorch | [`deepseek-ai/DeepSeek-OCR-2`](https://huggingface.co/deepseek-ai/DeepSeek-OCR-2) |
+
+You can override the model with `MODEL_NAME` if needed.
+
+## Reliability Features
+
+- First-run managed runtime setup with bundled `uv`
+- Hardware-aware environment provisioning
+- Startup status and preflight estimator
+- Diagnostics export (`ZIP`)
+- Retention policies for outputs/cache
+- Queue controls: pause/resume/cancel/retry
+
+## MCP Server (Codex / CLI / Other MCP Clients)
+
+MCP server is included at `backend/mcp_server.py`.
+
+It supports:
+- model load
+- single OCR
+- queue add/status/process/pause/resume/cancel/retry
+- diagnostics export
+- retention policy operations
+
+Quick reference and configs:
+- [`docs/mcp-server.md`](docs/mcp-server.md)
+
+## Build From Source
+
+### Prerequisites
 
 - Node.js 18+
 - Python 3.10-3.12
-- Optional: NVIDIA driver/CUDA-capable GPU for CUDA acceleration
+- Optional CUDA-capable NVIDIA GPU for CUDA acceleration
 
-## Quick Start
-
-### 1. Clone and install Node deps
+### Run in development
 
 ```bash
 npm ci
-```
-
-### 2. Run in source mode
-
-macOS/Linux:
-
-```bash
 ./start-client.sh
 ```
 
 Windows:
 
 ```bat
+npm ci
 start-client.bat
 ```
 
-### 3. In the app
+### Tests
 
-1. Click `Load Model` (first time downloads model)
-2. Drop/select an image or PDF
-3. Click `Run OCR`
+```bash
+npm run test:e2e
+npm run test:build:smoke
+npm run test:dist:host
+```
 
-### Default model routing
+### Build installers
 
-- Apple Silicon (MLX backend): `mlx-community/DeepSeek-OCR-2-8bit`
-- CUDA + CPU (PyTorch backend): `deepseek-ai/DeepSeek-OCR-2`
-- Override on any platform via `MODEL_NAME`
-
-## Queue Workflow
-
-- Add files or add a folder
-- Optional PDF page range: `1-3,5`
-- Click `Process Queue`
-- Use queue controls while running:
-  - `Pause`
-  - `Resume`
-  - `Cancel`
-  - `Retry Failed`
-
-Queue outputs are written under timestamped folders in the app cache output directory.
-
-## Basic vs Advanced Mode
-
-- `Basic`: simplified UI for common OCR flow
-- `Advanced`: exposes tuning + diagnostics + retention controls
-
-Mode is persisted locally.
-
-## Preflight, Diagnostics, and Retention
-
-- `Run Preflight`: estimates required disk/download and expected setup time
-- `Export Diagnostics`: writes a ZIP with app/backend diagnostics and log tails
-- Retention policy panel:
-  - Output retention days
-  - Max queue run folders
-  - Download-cache retention days
-  - Optional cleanup on startup
-
-## Build Installers / Distributions
-
-### Windows (NSIS)
+Windows:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\build-release.ps1
 ```
 
-### macOS/Linux
+macOS/Linux:
 
 ```bash
 bash ./scripts/build-release.sh
 ```
 
-### Manual dist commands
+Manual distro commands:
 
 ```bash
 npm run dist:win
@@ -126,90 +146,34 @@ npm run dist:mac
 npm run dist:linux
 ```
 
-## Testing
-
-### Electron E2E (mock backend)
-
-```bash
-npm run test:e2e
-```
-
-### Host build smoke
-
-```bash
-npm run test:build:smoke
-```
-
-### Host dist packaging
-
-```bash
-npm run test:dist:host
-```
-
-## CI
-
-- `.github/workflows/ci-e2e.yml`
-  - E2E + build smoke on Linux/macOS/Windows
-- `.github/workflows/dist-matrix.yml`
-  - Full host distribution packaging matrix (manual dispatch)
-
-## Security Model
-
-Renderer access is exposed through a restricted preload API:
-
-- `contextIsolation: true`
-- `nodeIntegration: false`
-- IPC channels wrapped by explicit preload methods
-
-## MCP Server (Codex/Claude/Any MCP Client)
-
-This project includes an MCP (Model Context Protocol) server at `backend/mcp_server.py` that can drive the same OCR flows as the UI: single-file OCR, queue control, model loading, diagnostics, and retention management.
-
-**Codex App / Codex CLI quick start**
-
-```bash
-cd /absolute/path/to/deepseek-ocr-client
-codex mcp add deepseek-ocr --env DEEPSEEK_OCR_URL=http://127.0.0.1:5000 -- \
-  "$(pwd)/venv/bin/python3" "$(pwd)/backend/mcp_server.py"
-codex mcp list
-```
-
-**Claude Code quick start**
-
-- Project config: `.claude/mcp_servers.json`
-- Optional plugin: `claude plugin install --path ./mcp-plugin`
-
-See [`docs/mcp-server.md`](docs/mcp-server.md) for full setup details, including Codex config snippets and troubleshooting.
-
-## Project Layout
-
-- `main.js`: Electron main process, runtime bootstrap, IPC, setup flow
-- `preload.js`: secure renderer bridge
-- `renderer.js`: UI logic
-- `backend/ocr_server.py`: Flask OCR backend + queue processing
-- `backend/mcp_server.py`: MCP server for LLM integration
-- `mcp-plugin/`: Claude Code plugin package
-- `runtime/`: bundled `uv` binaries
-- `scripts/`: release/test helpers
-- `tests/e2e/`: Playwright E2E suite + mock backend
-- `docs/`: analysis, testing strategy, and MCP documentation
-
 ## Troubleshooting
 
-- Model/setup issues:
-  - Run `Run Preflight` first, confirm disk/network are sufficient
-- Runtime/setup anomalies:
-  - Export diagnostics and inspect `diagnostics.json`
-- Queue stalls:
-  - Check queue state in UI (`paused`, `cancel requested`, failed items)
+- Setup stuck or failing:
+  - Run `Run Preflight`
+  - Check internet/disk availability
+- Model/runtime issues:
+  - Use `Export Diagnostics`
+  - Inspect `diagnostics.json` and log tails
+- Queue appears stalled:
+  - Verify pause/cancel state
+  - Retry failed items
 
-## Upstream and Fork Context
+## Technical Notes
 
-Original project:
+- Electron main process: `main.js`
+- Secure renderer bridge: `preload.js`
+- UI logic: `renderer.js`
+- OCR backend: `backend/ocr_server.py`
+- MCP server: `backend/mcp_server.py`
+- E2E tests: `tests/e2e/`
+- CI workflows: `.github/workflows/`
 
+## Upstream/Fork Context
+
+Original upstream:
 - [ihatecsv/deepseek-ocr-client](https://github.com/ihatecsv/deepseek-ocr-client)
 
-This repository is an actively maintained fork focused on installer/runtime reliability and multi-platform operation.
+This repository is an actively maintained fork focused on production desktop workflows, hardware-aware runtime setup, and DeepSeek-OCR-2 integration.
 
 ## License
 
