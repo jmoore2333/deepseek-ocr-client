@@ -886,7 +886,9 @@ async function startPythonServer() {
     backendArgs = [paths.mockBackendScript];
     backendEnv = {
       ...process.env,
-      MOCK_BACKEND_PORT: String(PYTHON_SERVER_PORT)
+      MOCK_BACKEND_PORT: String(PYTHON_SERVER_PORT),
+      // process.execPath is Electron in the main process; force Node-mode execution for mock backend scripts.
+      ELECTRON_RUN_AS_NODE: '1'
     };
     backendLogLabel = 'MockBackend';
     setStartupStatus('backend-launch', 'Launching mock backend service...', 96);
