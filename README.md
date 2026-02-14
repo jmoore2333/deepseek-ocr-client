@@ -21,7 +21,7 @@ It gives you one desktop surface for:
 - queue/batch processing
 - live detection overlays
 - setup diagnostics and retention controls
-- optional MCP control from Codex/CLI tooling
+- optional MCP control from Codex/Claude/CLI tooling
 
 ## Install (Simple Path)
 
@@ -81,7 +81,7 @@ You can override the model with `MODEL_NAME` if needed.
 - Retention policies for outputs/cache
 - Queue controls: pause/resume/cancel/retry
 
-## MCP Server (Codex / CLI / Other MCP Clients)
+## MCP Server (Codex / CLI / Claude / Other MCP Clients)
 
 MCP server is included at `backend/mcp_server.py`.
 
