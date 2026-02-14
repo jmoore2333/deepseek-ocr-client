@@ -460,9 +460,14 @@ def run_model_infer_mlx(**kwargs):
         kwargs.get('crop_mode')
     )
     try:
-        formatted_prompt = mlx_apply_chat_template(tokenizer, config=model.config, prompt=user_prompt)
+        formatted_prompt = mlx_apply_chat_template(
+            tokenizer,
+            config=model.config,
+            prompt=user_prompt,
+            num_images=1
+        )
     except TypeError:
-        formatted_prompt = mlx_apply_chat_template(tokenizer, prompt=user_prompt)
+        formatted_prompt = mlx_apply_chat_template(tokenizer, prompt=user_prompt, num_images=1)
     with inference_lock:
         generated = mlx_generate(
             model=model,
