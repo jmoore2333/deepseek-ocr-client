@@ -162,19 +162,17 @@ npm run dist:linux
 - Queue appears stalled:
   - Verify pause/cancel state
   - Retry failed items
-- Linux release builds on restricted endpoints:
-  - `scripts/build-release.sh` now defaults `ELECTRON_BUILDER_CACHE` to project-local `.cache/electron-builder`.
-  - If AppImage/deb tool downloads are blocked, build an unpacked artifact with:
-    - `LINUX_TARGETS="dir" bash ./scripts/build-release.sh`
-  - For full installer output (`AppImage` + `deb`), rerun with network access or a prewarmed builder cache.
-- uv runtime download fails during release build:
-  - The script reuses `runtime/uv` or a system `uv` on `PATH` before downloading.
-  - Set `FORCE_UV_DOWNLOAD=1` to force a fresh pinned download.
+- CUDA dtype mismatch (`Half and Float`) on pre-Ampere GPUs:
+  - Fixed in v2.0.0. The upstream model hardcodes bfloat16 autocast which fails on Turing/Pascal GPUs.
+  - The backend auto-patches the model forward pass on Compute < 8.0 GPUs (any OS).
 - Linux CUDA out-of-memory during OCR:
-  - Backend now defaults `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` on Linux only.
+  - Backend defaults `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` on Linux.
   - `torch.compile` is disabled by default on Linux CUDA for stability (enable with `DEEPSEEK_OCR_ENABLE_TORCH_COMPILE=1`).
-  - On Linux CUDA OOM, backend auto-retries once with lower memory settings (smaller base/size, crop off, lower token cap).
-  - To disable Linux-only retry behavior: `DEEPSEEK_OCR_LINUX_CUDA_OOM_RETRY=0`.
+  - On OOM, backend auto-retries once with lower memory settings.
+- Linux build tips:
+  - `scripts/build-release.sh` defaults `ELECTRON_BUILDER_CACHE` to project-local `.cache/electron-builder`.
+  - For offline builds: `LINUX_TARGETS="dir" bash ./scripts/build-release.sh`
+  - The uv download script reuses existing `runtime/uv` or system `uv` before downloading.
 
 ## Technical Notes
 
