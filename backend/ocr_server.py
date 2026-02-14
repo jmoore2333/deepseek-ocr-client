@@ -38,11 +38,12 @@ except Exception as exc:  # pragma: no cover - depends on runtime platform/env.
 
 MLX_IMPORT_ERROR = None
 try:
-    from mlx_vlm import load as mlx_load, generate as mlx_generate
+    from mlx_vlm import load as mlx_load, generate as mlx_generate, stream_generate as mlx_stream_generate
     from mlx_vlm.prompt_utils import apply_chat_template as mlx_apply_chat_template
 except Exception as exc:  # pragma: no cover - depends on runtime platform/env.
     mlx_load = None
     mlx_generate = None
+    mlx_stream_generate = None
     mlx_apply_chat_template = None
     MLX_IMPORT_ERROR = str(exc)
 
@@ -426,7 +427,8 @@ def to_mlx_prompt(raw_prompt):
     if not prompt:
         return "Convert this image to markdown."
 
-    prompt = prompt.replace('<image>', '').replace('<|grounding|>', '').strip()
+    # Keep <|grounding|> so DeepSeek-OCR-2 emits <|ref|>/<|det|> tokens for overlay boxes.
+    prompt = prompt.replace('<image>', '').strip()
     if not prompt:
         return "Convert this image to markdown."
     return prompt
@@ -443,9 +445,53 @@ def extract_text_from_mlx_output(generated):
     return str(generated)
 
 
+GROUNDING_TOKEN_PATTERN = re.compile(
+    r'<\|ref\|>([^<]*)<\|/ref\|><\|det\|>\[\[([^\]]+)\]\]<\|/det\|>',
+    re.MULTILINE
+)
+
+
+def contains_grounding_tokens(text):
+    if not text:
+        return False
+    return bool(GROUNDING_TOKEN_PATTERN.search(text))
+
+
+def extract_grounding_ref_text(token_text):
+    if not token_text:
+        return ''
+    refs = [match.group(1).strip() for match in GROUNDING_TOKEN_PATTERN.finditer(token_text)]
+    refs = [entry for entry in refs if entry]
+    return '\n'.join(refs).strip()
+
+
+def strip_grounding_tokens(token_text):
+    if not token_text:
+        return token_text
+    stripped = GROUNDING_TOKEN_PATTERN.sub('', token_text)
+    return stripped.strip()
+
+
+def normalize_mlx_output(prompt_type, generated_text):
+    normalized_prompt_type = str(prompt_type or '').strip().lower()
+    raw_token_text = generated_text if contains_grounding_tokens(generated_text) else None
+    cleaned_text = (generated_text or '').strip()
+
+    if raw_token_text:
+        if normalized_prompt_type == 'ocr':
+            extracted = extract_grounding_ref_text(raw_token_text)
+            if extracted:
+                cleaned_text = extracted
+        elif normalized_prompt_type == 'document':
+            cleaned_text = strip_grounding_tokens(raw_token_text)
+
+    return cleaned_text, raw_token_text
+
+
 def run_model_infer_mlx(**kwargs):
     global model, tokenizer
     max_new_tokens_cap = resolve_max_new_tokens_cap(kwargs.pop('max_new_tokens_cap', None))
+    progress_callback = kwargs.pop('progress_callback', None)
     image_file = kwargs.get('image_file')
     if not image_file:
         raise ValueError('Missing image file path for MLX inference')
@@ -469,6 +515,31 @@ def run_model_infer_mlx(**kwargs):
     except TypeError:
         formatted_prompt = mlx_apply_chat_template(tokenizer, prompt=user_prompt, num_images=1)
     with inference_lock:
+        if mlx_stream_generate is not None and callable(progress_callback):
+            streamed_chunks = []
+            try:
+                for partial in mlx_stream_generate(
+                    model,
+                    tokenizer,
+                    formatted_prompt,
+                    image=image_file,
+                    max_tokens=max_new_tokens_cap,
+                    temperature=0.0
+                ):
+                    text_chunk = getattr(partial, 'text', '')
+                    if not text_chunk:
+                        continue
+                    streamed_chunks.append(text_chunk)
+                    try:
+                        progress_callback(''.join(streamed_chunks))
+                    except Exception as callback_exc:
+                        logger.debug(f"Ignoring MLX progress callback error: {callback_exc}")
+                if streamed_chunks:
+                    return ''.join(streamed_chunks)
+                logger.warning("MLX stream generation produced no text chunks; retrying non-streaming generation")
+            except Exception as stream_exc:
+                logger.warning(f"MLX stream generation failed, retrying non-streaming generation: {stream_exc}")
+
         generated = mlx_generate(
             model=model,
             processor=tokenizer,
@@ -829,10 +900,29 @@ def run_model_infer_with_heartbeat(
         elapsed = max(1, int(time.time() - started_at))
         message = message_builder(elapsed)
         progress_percent = progress_builder(elapsed) if callable(progress_builder) else None
+        chars_generated = 0
+        raw_token_stream = ''
+        current_page_image = ''
         if progress_percent is None:
             with progress_lock:
                 progress_percent = progress_data.get('progress_percent', 0)
-        update_progress(status, stage, message, int(progress_percent), 0)
+                chars_generated = progress_data.get('chars_generated', 0)
+                raw_token_stream = progress_data.get('raw_token_stream', '')
+                current_page_image = progress_data.get('current_page_image', '')
+        else:
+            with progress_lock:
+                chars_generated = progress_data.get('chars_generated', 0)
+                raw_token_stream = progress_data.get('raw_token_stream', '')
+                current_page_image = progress_data.get('current_page_image', '')
+        update_progress(
+            status,
+            stage,
+            message,
+            int(progress_percent),
+            chars_generated,
+            raw_token_stream,
+            current_page_image=current_page_image
+        )
 
     if result_holder['error'] is not None:
         raise result_holder['error']
@@ -1453,6 +1543,8 @@ def perform_ocr():
                         heartbeat_seconds=2.0
                     )
                     page_text = page_infer_result if isinstance(page_infer_result, str) else ''
+                    if RUNTIME_BACKEND == 'mlx' and page_text:
+                        page_text, _ = normalize_mlx_output(prompt_type, page_text)
                     if not page_text:
                         page_text = read_result_text(OUTPUT_DIR, expected_output_file) or ''
                     if prompt_type == 'document':
@@ -1488,6 +1580,19 @@ def perform_ocr():
         char_stream = None
 
         if RUNTIME_BACKEND == 'mlx':
+            def mlx_live_progress(raw_token_text):
+                chars_generated = len(raw_token_text or '')
+                if chars_generated <= 0:
+                    return
+                update_progress(
+                    'processing',
+                    'ocr',
+                    'Generating OCR...',
+                    estimate_stream_progress(chars_generated),
+                    chars_generated,
+                    raw_token_text
+                )
+
             infer_result = run_model_infer_with_heartbeat(
                 infer_kwargs={
                     'prompt': prompt,
@@ -1497,7 +1602,8 @@ def perform_ocr():
                     'image_size': image_size,
                     'crop_mode': crop_mode,
                     'save_results': True,
-                    'test_compress': False
+                    'test_compress': False,
+                    'progress_callback': mlx_live_progress
                 },
                 status='processing',
                 stage='ocr',
@@ -1561,7 +1667,13 @@ def perform_ocr():
                 sys.stdout = old_stdout
 
         logger.info("OCR inference completed successfully")
+        raw_token_text = extract_raw_token_section(char_stream.accumulated_text) if char_stream else None
         result_text = infer_result if isinstance(infer_result, str) else None
+        if RUNTIME_BACKEND == 'mlx' and isinstance(infer_result, str):
+            normalized_text, mlx_raw_tokens = normalize_mlx_output(prompt_type, infer_result)
+            result_text = normalized_text or result_text
+            if mlx_raw_tokens:
+                raw_token_text = mlx_raw_tokens
         if not result_text:
             result_text = read_result_text(OUTPUT_DIR, expected_output_file)
         if result_text is None:
@@ -1570,7 +1682,6 @@ def perform_ocr():
 
         boxes_image_path = os.path.join(OUTPUT_DIR, 'result_with_boxes.jpg')
         has_boxes_image = os.path.exists(boxes_image_path)
-        raw_token_text = extract_raw_token_section(char_stream.accumulated_text) if char_stream else None
 
         return jsonify({
             'status': 'success',
@@ -1880,6 +1991,8 @@ def process_queue():
                             )
 
                             page_text = page_infer_result if isinstance(page_infer_result, str) else ''
+                            if RUNTIME_BACKEND == 'mlx' and page_text:
+                                page_text, _ = normalize_mlx_output(item['prompt_type'], page_text)
                             if not page_text:
                                 page_text = read_result_text(page_output_dir, result_file) or ''
                             if item['prompt_type'] == 'document':
@@ -2008,6 +2121,9 @@ def process_queue():
 
                     if isinstance(infer_result, str) and infer_result:
                         result_text = infer_result
+                        if RUNTIME_BACKEND == 'mlx':
+                            normalized_text, _ = normalize_mlx_output(item['prompt_type'], result_text)
+                            result_text = normalized_text or result_text
                     else:
                         result_text = read_result_text(file_output_dir, result_file)
 
