@@ -1034,7 +1034,7 @@ async function startPythonServer() {
 
 async function checkServerHealth() {
   try {
-    const response = await axios.get(`${PYTHON_SERVER_URL}/health`);
+    const response = await axios.get(`${PYTHON_SERVER_URL}/health`, { timeout: 2000 });
     return response.data.status === 'ok';
   } catch (error) {
     throw error;
@@ -1166,7 +1166,7 @@ async function saveDocumentZip(markdownText) {
 // IPC Handlers
 ipcMain.handle('check-server-status', async () => {
   try {
-    const response = await axios.get(`${PYTHON_SERVER_URL}/health`);
+    const response = await axios.get(`${PYTHON_SERVER_URL}/health`, { timeout: 2000 });
     return { success: true, data: response.data };
   } catch (error) {
     return { success: false, error: error.message };
