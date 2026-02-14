@@ -50,6 +50,7 @@ It gives you one desktop surface for:
 4. While running, you can `Pause`, `Cancel`, or `Retry Failed`.
 
 ![Queue active state](docs/images/ui-queue-active.png)
+![Queue in progress state](docs/images/ui-queue-inprogress.png)
 
 ## Basic vs Advanced Mode
 
