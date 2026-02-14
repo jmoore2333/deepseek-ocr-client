@@ -553,8 +553,9 @@ async function checkServerStatus() {
 
             const preferredDevice = String(result.data.preferred_device || result.data.device_state || 'cpu').toLowerCase();
             const activeDevice = String(result.data.device_state || 'cpu').toLowerCase();
+            const runtimeBackend = String(result.data.runtime_backend || '').toLowerCase();
             const effectiveDevice = modelLoaded ? activeDevice : preferredDevice;
-            const hasGpuReady = effectiveDevice === 'cuda' || effectiveDevice === 'mps';
+            const hasGpuReady = effectiveDevice === 'cuda' || effectiveDevice === 'mps' || runtimeBackend === 'mlx';
 
             if (modelLoaded && activeDevice === 'cpu' && (preferredDevice === 'cuda' || preferredDevice === 'mps')) {
                 gpuStatus.textContent = 'CPU (fallback)';
@@ -563,7 +564,9 @@ async function checkServerStatus() {
                 gpuStatus.textContent = modelLoaded ? 'CUDA Active' : 'CUDA Ready';
                 gpuStatus.className = 'status-value success';
             } else if (effectiveDevice === 'mps') {
-                gpuStatus.textContent = modelLoaded ? 'Apple MPS Active' : 'Apple MPS Ready';
+                gpuStatus.textContent = runtimeBackend === 'mlx'
+                    ? (modelLoaded ? 'Apple MLX Active' : 'Apple MLX Ready')
+                    : (modelLoaded ? 'Apple MPS Active' : 'Apple MPS Ready');
                 gpuStatus.className = 'status-value success';
             } else {
                 gpuStatus.textContent = hasGpuReady ? 'Available' : 'CPU Only';

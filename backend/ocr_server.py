@@ -12,8 +12,6 @@ import shutil
 import platform
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
-import torch
-from transformers import AutoModel, AutoTokenizer
 import tempfile
 import time
 import json
@@ -22,6 +20,31 @@ from collections import deque
 from datetime import datetime
 from threading import Thread, Lock, Event
 from pathlib import Path
+
+TORCH_IMPORT_ERROR = None
+try:
+    import torch
+except Exception as exc:  # pragma: no cover - depends on runtime platform/env.
+    torch = None
+    TORCH_IMPORT_ERROR = str(exc)
+
+TRANSFORMERS_IMPORT_ERROR = None
+try:
+    from transformers import AutoModel, AutoTokenizer
+except Exception as exc:  # pragma: no cover - depends on runtime platform/env.
+    AutoModel = None
+    AutoTokenizer = None
+    TRANSFORMERS_IMPORT_ERROR = str(exc)
+
+MLX_IMPORT_ERROR = None
+try:
+    from mlx_vlm import load as mlx_load, generate as mlx_generate
+    from mlx_vlm.prompt_utils import apply_chat_template as mlx_apply_chat_template
+except Exception as exc:  # pragma: no cover - depends on runtime platform/env.
+    mlx_load = None
+    mlx_generate = None
+    mlx_apply_chat_template = None
+    MLX_IMPORT_ERROR = str(exc)
 
 # Reduce noisy tokenizers fork warnings from child process startup/log streaming.
 os.environ.setdefault('TOKENIZERS_PARALLELISM', 'false')
@@ -59,19 +82,31 @@ CORS(app)
 model = None
 tokenizer = None
 device = 'cpu'
-dtype = torch.float32
+dtype = torch.float32 if torch is not None else 'float32'
 
 
 def is_device_available(device_name):
     normalized = str(device_name or '').lower()
+    if normalized == 'mlx':
+        return is_mlx_available()
     if normalized == 'cuda':
+        if not is_torch_available():
+            return False
         return torch.cuda.is_available()
     if normalized == 'mps':
+        if is_mlx_available():
+            return True
+        if not is_torch_available():
+            return False
         return hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()
     return normalized == 'cpu'
 
 
 def detect_best_available_device():
+    if is_mlx_available():
+        return 'mps'
+    if not is_torch_available():
+        return 'cpu'
     if torch.cuda.is_available():
         return 'cuda'
     if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
@@ -81,6 +116,8 @@ def detect_best_available_device():
 
 def map_gpu_target_to_device(gpu_target):
     normalized = str(gpu_target or '').strip().lower()
+    if normalized == 'mlx':
+        return 'mps'
     if normalized.startswith('cuda-'):
         return 'cuda'
     if normalized == 'mps':
@@ -88,11 +125,62 @@ def map_gpu_target_to_device(gpu_target):
     return 'cpu'
 
 
+def is_torch_available():
+    return torch is not None
+
+
+def is_mlx_available():
+    return mlx_load is not None and mlx_generate is not None and mlx_apply_chat_template is not None
+
+
+def resolve_runtime_backend():
+    forced_backend = str(os.environ.get('DEEPSEEK_OCR_BACKEND', '')).strip().lower()
+    gpu_target_hint = str(os.environ.get('DEEPSEEK_OCR_GPU_TARGET', '')).strip().lower()
+    prefer_mlx = gpu_target_hint == 'mlx'
+
+    if forced_backend:
+        if forced_backend not in ('torch', 'mlx'):
+            logger.warning(
+                "Unsupported DEEPSEEK_OCR_BACKEND=%r; expected 'torch' or 'mlx'",
+                forced_backend
+            )
+        elif forced_backend == 'mlx':
+            if is_mlx_available():
+                return 'mlx'
+            logger.warning("MLX backend requested but unavailable: %s", MLX_IMPORT_ERROR or 'mlx-vlm import failed')
+        elif forced_backend == 'torch':
+            if is_torch_available():
+                return 'torch'
+            logger.warning("Torch backend requested but unavailable: %s", TORCH_IMPORT_ERROR or 'torch import failed')
+
+    if prefer_mlx:
+        if is_mlx_available():
+            return 'mlx'
+        logger.warning(
+            "GPU target hint requested MLX, but mlx-vlm is unavailable: %s. Falling back.",
+            MLX_IMPORT_ERROR or 'mlx-vlm import failed'
+        )
+
+    if is_torch_available():
+        return 'torch'
+    if is_mlx_available():
+        return 'mlx'
+    return 'unavailable'
+
+
+RUNTIME_BACKEND = resolve_runtime_backend()
+
+
 def get_preferred_device():
     """Select runtime device based on explicit overrides, then detected availability."""
+    if RUNTIME_BACKEND == 'mlx':
+        return 'mps'
+
     if 'DEVICE' in os.environ:
         forced_device = str(os.environ['DEVICE']).strip().lower()
-        if forced_device in ('cpu', 'cuda', 'mps'):
+        if forced_device in ('cpu', 'cuda', 'mps', 'mlx'):
+            if forced_device == 'mlx':
+                forced_device = 'mps'
             if is_device_available(forced_device):
                 return forced_device
             fallback = detect_best_available_device()
@@ -105,7 +193,7 @@ def get_preferred_device():
 
         fallback = detect_best_available_device()
         logger.warning(
-            "Unsupported DEVICE override %r; expected cpu/cuda/mps. Falling back to %s",
+            "Unsupported DEVICE override %r; expected cpu/cuda/mps/mlx. Falling back to %s",
             forced_device,
             fallback
         )
@@ -129,15 +217,23 @@ def get_preferred_device():
 
 
 def get_preferred_model_name():
-    """Use upstream model for CUDA, MPS/CPU-compatible fork otherwise."""
+    """Select default model based on active inference backend/device."""
     if 'MODEL_NAME' in os.environ:
         return os.environ['MODEL_NAME']
+    if RUNTIME_BACKEND == 'mlx':
+        return 'mlx-community/DeepSeek-OCR-2-8bit'
     if get_preferred_device() == 'cuda':
         return 'deepseek-ai/DeepSeek-OCR'
     return 'Dogacel/DeepSeek-OCR-Metal-MPS'
 
 
 MODEL_NAME = get_preferred_model_name()
+logger.info(
+    "Runtime backend selected: %s (gpu_target_hint=%s, model=%s)",
+    RUNTIME_BACKEND,
+    os.environ.get('DEEPSEEK_OCR_GPU_TARGET'),
+    MODEL_NAME
+)
 
 # Queue processing state
 processing_queue = []
@@ -230,6 +326,9 @@ def update_progress(status, stage='', message='', progress_percent=0, chars_gene
                 logger.info(f"Progress: {status} - {stage} - {message} ({progress_percent}%)")
 
 def log_selected_device(selected_device):
+    if RUNTIME_BACKEND == 'mlx':
+        logger.info("Using Apple Silicon GPU (MLX)")
+        return
     if selected_device == 'cuda':
         logger.info(f"Using CUDA: {torch.cuda.get_device_name(0)}")
     elif selected_device == 'mps':
@@ -322,8 +421,63 @@ def invoke_infer_with_generation_cap(infer_call, max_new_tokens_cap):
                 pass
 
 
-def run_model_infer(**kwargs):
-    """Run model inference with device arguments when supported by the model."""
+def to_mlx_prompt(raw_prompt):
+    prompt = (raw_prompt or '').strip()
+    if not prompt:
+        return "Convert this image to markdown."
+
+    prompt = prompt.replace('<image>', '').replace('<|grounding|>', '').strip()
+    if not prompt:
+        return "Convert this image to markdown."
+    return prompt
+
+
+def extract_text_from_mlx_output(generated):
+    if generated is None:
+        return ''
+    if isinstance(generated, str):
+        return generated
+    text_value = getattr(generated, 'text', None)
+    if isinstance(text_value, str):
+        return text_value
+    return str(generated)
+
+
+def run_model_infer_mlx(**kwargs):
+    global model, tokenizer
+    max_new_tokens_cap = resolve_max_new_tokens_cap(kwargs.pop('max_new_tokens_cap', None))
+    image_file = kwargs.get('image_file')
+    if not image_file:
+        raise ValueError('Missing image file path for MLX inference')
+
+    raw_prompt = kwargs.get('prompt')
+    user_prompt = to_mlx_prompt(raw_prompt)
+    logger.info(
+        "MLX inference settings: max_new_tokens_cap=%s base_size=%s image_size=%s crop_mode=%s",
+        max_new_tokens_cap,
+        kwargs.get('base_size'),
+        kwargs.get('image_size'),
+        kwargs.get('crop_mode')
+    )
+    try:
+        formatted_prompt = mlx_apply_chat_template(tokenizer, config=model.config, prompt=user_prompt)
+    except TypeError:
+        formatted_prompt = mlx_apply_chat_template(tokenizer, prompt=user_prompt)
+    with inference_lock:
+        generated = mlx_generate(
+            model=model,
+            processor=tokenizer,
+            image=image_file,
+            prompt=formatted_prompt,
+            max_tokens=max_new_tokens_cap,
+            temperature=0.0,
+            verbose=False
+        )
+    return extract_text_from_mlx_output(generated)
+
+
+def run_model_infer_torch(**kwargs):
+    """Run torch-backed model inference with device arguments when supported by the model."""
     global model, tokenizer, device, dtype
     max_new_tokens_cap = resolve_max_new_tokens_cap(kwargs.pop('max_new_tokens_cap', None))
 
@@ -372,11 +526,53 @@ def run_model_infer(**kwargs):
         logger.info("Retrying inference after model readiness confirmed on MPS")
         return invoke_with_guards()
 
+
+def run_model_infer(**kwargs):
+    if RUNTIME_BACKEND == 'mlx':
+        return run_model_infer_mlx(**kwargs)
+    return run_model_infer_torch(**kwargs)
+
+
+def load_model_background_mlx():
+    """Load MLX model/processor for Apple Silicon."""
+    global model, tokenizer, device, dtype
+
+    update_progress('loading', 'init', 'Initializing MLX model loading...', 0)
+    logger.info(f"Loading MLX DeepSeek OCR model from {MODEL_NAME}")
+    logger.info(f"Model cache directory: {MODEL_CACHE_DIR}")
+    os.makedirs(MODEL_CACHE_DIR, exist_ok=True)
+
+    device = 'mps'
+    dtype = 'float16'
+    log_selected_device(device)
+
+    update_progress('loading', 'tokenizer', 'Loading MLX processor...', 15)
+    update_progress('loading', 'model', 'Loading MLX model (first run downloads files)...', 35)
+    model, tokenizer = mlx_load(MODEL_NAME)
+
+    update_progress('loading', 'optimize', 'Finalizing MLX runtime...', 90)
+    logger.info("MLX model loaded successfully")
+    update_progress('loaded', 'complete', 'Model ready!', 100)
+
+
 def load_model_background():
     """Background thread function to load the model"""
     global model, tokenizer, device, dtype
 
     try:
+        if RUNTIME_BACKEND == 'mlx':
+            if not is_mlx_available():
+                raise RuntimeError(f"MLX backend unavailable: {MLX_IMPORT_ERROR or 'mlx-vlm import failed'}")
+            load_model_background_mlx()
+            return
+
+        if not is_torch_available():
+            raise RuntimeError(f"Torch backend unavailable: {TORCH_IMPORT_ERROR or 'torch import failed'}")
+        if AutoModel is None or AutoTokenizer is None:
+            raise RuntimeError(
+                f"Transformers unavailable: {TRANSFORMERS_IMPORT_ERROR or 'transformers import failed'}"
+            )
+
         update_progress('loading', 'init', 'Initializing model loading...', 0)
         logger.info(f"Loading DeepSeek OCR model from {MODEL_NAME}...")
         logger.info(f"Model will be cached in: {MODEL_CACHE_DIR}")
@@ -595,7 +791,7 @@ def wait_for_model_ready(timeout_seconds=600, poll_seconds=0.5):
 
 def clear_cuda_cache():
     """Clear CUDA cache to free memory between processing"""
-    if device == 'cuda' and torch.cuda.is_available():
+    if torch is not None and device == 'cuda' and torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
 
@@ -1066,7 +1262,12 @@ def collect_runtime_diagnostics():
         'runtime': {
             'python_version': sys.version,
             'platform': platform.platform(),
-            'pid': os.getpid()
+            'pid': os.getpid(),
+            'backend': RUNTIME_BACKEND,
+            'torch_available': is_torch_available(),
+            'mlx_available': is_mlx_available(),
+            'torch_import_error': TORCH_IMPORT_ERROR,
+            'mlx_import_error': MLX_IMPORT_ERROR
         },
         'model': {
             'model_name': MODEL_NAME,
@@ -1075,6 +1276,7 @@ def collect_runtime_diagnostics():
             'preferred_device': preferred_device,
             'device': device,
             'dtype': str(dtype),
+            'runtime_backend': RUNTIME_BACKEND,
             'gpu_target_hint': gpu_target_hint,
             'gpu_target_device_hint': map_gpu_target_to_device(gpu_target_hint) if gpu_target_hint else None
         },
@@ -1102,6 +1304,9 @@ def health_check():
     model_ready = is_model_ready()
     return jsonify({
         'status': 'ok',
+        'runtime_backend': RUNTIME_BACKEND,
+        'torch_available': is_torch_available(),
+        'mlx_available': is_mlx_available(),
         'model_loaded': model_ready,
         'model_initialized': model is not None and tokenizer is not None,
         'loading_in_progress': is_loading_in_progress(),
@@ -1272,71 +1477,95 @@ def perform_ocr():
                 }
             })
 
-        # Image flow with token streaming progress
+        # Image flow
         clear_output_artifacts(OUTPUT_DIR)
-        old_stdout = sys.stdout
-        char_count = [0]
+        infer_result = None
+        char_stream = None
 
-        class CharCountingStream:
-            def __init__(self, original_stdout):
-                self.original = original_stdout
-                self.accumulated_text = ''
-
-            def write(self, text):
-                try:
-                    self.original.write(text)
-                except UnicodeEncodeError:
-                    try:
-                        safe_text = text.encode(
-                            self.original.encoding or 'utf-8',
-                            errors='replace'
-                        ).decode(self.original.encoding or 'utf-8')
-                        self.original.write(safe_text)
-                    except Exception:
-                        pass
-
-                self.accumulated_text += text
-                raw_token_text = extract_raw_token_section(self.accumulated_text)
-                if raw_token_text:
-                    char_count[0] = len(raw_token_text)
-                    update_progress(
-                        'processing',
-                        'ocr',
-                        'Generating OCR...',
-                        estimate_stream_progress(char_count[0]),
-                        char_count[0],
-                        raw_token_text
-                    )
-
-            def flush(self):
-                self.original.flush()
-
-        char_stream = CharCountingStream(old_stdout)
-        sys.stdout = char_stream
-
-        try:
-            run_model_infer(
-                prompt=prompt,
-                image_file=temp_input_path,
-                output_path=OUTPUT_DIR,
-                base_size=base_size,
-                image_size=image_size,
-                crop_mode=crop_mode,
-                save_results=True,
-                test_compress=False
+        if RUNTIME_BACKEND == 'mlx':
+            infer_result = run_model_infer_with_heartbeat(
+                infer_kwargs={
+                    'prompt': prompt,
+                    'image_file': temp_input_path,
+                    'output_path': OUTPUT_DIR,
+                    'base_size': base_size,
+                    'image_size': image_size,
+                    'crop_mode': crop_mode,
+                    'save_results': True,
+                    'test_compress': False
+                },
+                status='processing',
+                stage='ocr',
+                message_builder=lambda elapsed: f'Running MLX OCR... {elapsed}s elapsed',
+                progress_builder=lambda elapsed: min(95, 25 + (elapsed * 2)),
+                heartbeat_seconds=1.5
             )
-        finally:
-            sys.stdout = old_stdout
+        else:
+            old_stdout = sys.stdout
+            char_count = [0]
+
+            class CharCountingStream:
+                def __init__(self, original_stdout):
+                    self.original = original_stdout
+                    self.accumulated_text = ''
+
+                def write(self, text):
+                    try:
+                        self.original.write(text)
+                    except UnicodeEncodeError:
+                        try:
+                            safe_text = text.encode(
+                                self.original.encoding or 'utf-8',
+                                errors='replace'
+                            ).decode(self.original.encoding or 'utf-8')
+                            self.original.write(safe_text)
+                        except Exception:
+                            pass
+
+                    self.accumulated_text += text
+                    raw_token_text = extract_raw_token_section(self.accumulated_text)
+                    if raw_token_text:
+                        char_count[0] = len(raw_token_text)
+                        update_progress(
+                            'processing',
+                            'ocr',
+                            'Generating OCR...',
+                            estimate_stream_progress(char_count[0]),
+                            char_count[0],
+                            raw_token_text
+                        )
+
+                def flush(self):
+                    self.original.flush()
+
+            char_stream = CharCountingStream(old_stdout)
+            sys.stdout = char_stream
+
+            try:
+                infer_result = run_model_infer(
+                    prompt=prompt,
+                    image_file=temp_input_path,
+                    output_path=OUTPUT_DIR,
+                    base_size=base_size,
+                    image_size=image_size,
+                    crop_mode=crop_mode,
+                    save_results=True,
+                    test_compress=False
+                )
+            finally:
+                sys.stdout = old_stdout
 
         logger.info("OCR inference completed successfully")
-        result_text = read_result_text(OUTPUT_DIR, expected_output_file)
+        result_text = infer_result if isinstance(infer_result, str) else None
+        if not result_text:
+            result_text = read_result_text(OUTPUT_DIR, expected_output_file)
         if result_text is None:
             result_text = "OCR completed but no text file was generated"
             logger.warning("No result file found in output directory")
 
         boxes_image_path = os.path.join(OUTPUT_DIR, 'result_with_boxes.jpg')
         has_boxes_image = os.path.exists(boxes_image_path)
-        raw_token_text = extract_raw_token_section(char_stream.accumulated_text)
+        raw_token_text = extract_raw_token_section(char_stream.accumulated_text) if char_stream else None
 
         return jsonify({
             'status': 'success',
@@ -1370,6 +1599,9 @@ def model_info():
     """Get information about the model"""
     gpu_target_hint = os.environ.get('DEEPSEEK_OCR_GPU_TARGET')
     return jsonify({
+        'runtime_backend': RUNTIME_BACKEND,
+        'torch_available': is_torch_available(),
+        'mlx_available': is_mlx_available(),
         'model_name': MODEL_NAME,
         'cache_dir': MODEL_CACHE_DIR,
         'model_loaded': is_model_ready(),
@@ -1379,7 +1611,7 @@ def model_info():
         'gpu_target_device_hint': map_gpu_target_to_device(gpu_target_hint) if gpu_target_hint else None,
         'preferred_device': get_preferred_device(),
         'device_state': device,
-        'gpu_name': torch.cuda.get_device_name(0) if (device == 'cuda' and torch.cuda.is_available()) else None
+        'gpu_name': torch.cuda.get_device_name(0) if (torch is not None and device == 'cuda' and torch.cuda.is_available()) else None
     })
 
 @app.route('/queue/add', methods=['POST'])
@@ -1683,52 +1915,82 @@ def process_queue():
                         item['current_image_path'] = item['temp_path']
                         item['progress_detail'] = format_queue_progress_detail(1, 1, paused=False)
 
-                    old_stdout = sys.stdout
-                    char_count = [0]
+                    infer_result = None
+                    if RUNTIME_BACKEND == 'mlx':
+                        def mlx_progress(elapsed, idx=idx, total_items=total_items, item=item):
+                            file_progress = min(95, max(1, int(elapsed * 3)))
+                            with queue_lock:
+                                is_paused = queue_paused
+                                item['progress'] = file_progress
+                                item['progress_detail'] = format_queue_progress_detail(1, 1, paused=is_paused)
+                            return int(((idx + (file_progress / 100.0)) / total_items) * 100)
 
-                    class CharCountingStream:
-                        def __init__(self):
-                            self.accumulated_text = ''
-
-                        def write(self, text):
-                            self.accumulated_text += text
-                            raw_token_text = extract_raw_token_section(self.accumulated_text)
-                            if raw_token_text:
-                                char_count[0] = len(raw_token_text)
-                                file_progress = estimate_stream_progress(char_count[0])
-                                overall_progress = int(((idx + (file_progress / 100.0)) / total_items) * 100)
-                                with queue_lock:
-                                    is_paused = queue_paused
-                                    item['progress'] = file_progress
-                                    item['progress_detail'] = format_queue_progress_detail(1, 1, paused=is_paused)
-                                update_progress(
-                                    'processing',
-                                    'queue',
-                                    f"[{idx + 1}/{len(items_to_process)}] {item['filename']} (page 1/1)",
-                                    overall_progress,
-                                    char_count[0],
-                                    raw_token_text
-                                )
-
-                        def flush(self):
-                            pass
-
-                    char_stream = CharCountingStream()
-                    sys.stdout = char_stream
-                    try:
                         clear_output_artifacts(file_output_dir)
-                        run_model_infer(
-                            prompt=prompt,
-                            image_file=item['temp_path'],
-                            output_path=file_output_dir,
-                            base_size=effective_base_size,
-                            image_size=effective_image_size,
-                            crop_mode=effective_crop_mode,
-                            save_results=True,
-                            test_compress=False
+                        infer_result = run_model_infer_with_heartbeat(
+                            infer_kwargs={
+                                'prompt': prompt,
+                                'image_file': item['temp_path'],
+                                'output_path': file_output_dir,
+                                'base_size': effective_base_size,
+                                'image_size': effective_image_size,
+                                'crop_mode': effective_crop_mode,
+                                'save_results': True,
+                                'test_compress': False
+                            },
+                            status='processing',
+                            stage='queue',
+                            message_builder=lambda elapsed, idx=idx, total=len(items_to_process), filename=item['filename']:
+                                f"[{idx + 1}/{total}] {filename}... {elapsed}s elapsed",
+                            progress_builder=mlx_progress,
+                            heartbeat_seconds=1.5
                         )
-                    finally:
-                        sys.stdout = old_stdout
+                    else:
+                        old_stdout = sys.stdout
+                        char_count = [0]
+
+                        class CharCountingStream:
+                            def __init__(self):
+                                self.accumulated_text = ''
+
+                            def write(self, text):
+                                self.accumulated_text += text
+                                raw_token_text = extract_raw_token_section(self.accumulated_text)
+                                if raw_token_text:
+                                    char_count[0] = len(raw_token_text)
+                                    file_progress = estimate_stream_progress(char_count[0])
+                                    overall_progress = int(((idx + (file_progress / 100.0)) / total_items) * 100)
+                                    with queue_lock:
+                                        is_paused = queue_paused
+                                        item['progress'] = file_progress
+                                        item['progress_detail'] = format_queue_progress_detail(1, 1, paused=is_paused)
+                                    update_progress(
+                                        'processing',
+                                        'queue',
+                                        f"[{idx + 1}/{len(items_to_process)}] {item['filename']} (page 1/1)",
+                                        overall_progress,
+                                        char_count[0],
+                                        raw_token_text
+                                    )
+
+                            def flush(self):
+                                pass
+
+                        char_stream = CharCountingStream()
+                        sys.stdout = char_stream
+                        try:
+                            clear_output_artifacts(file_output_dir)
+                            infer_result = run_model_infer(
+                                prompt=prompt,
+                                image_file=item['temp_path'],
+                                output_path=file_output_dir,
+                                base_size=effective_base_size,
+                                image_size=effective_image_size,
+                                crop_mode=effective_crop_mode,
+                                save_results=True,
+                                test_compress=False
+                            )
+                        finally:
+                            sys.stdout = old_stdout
 
                     if queue_should_stop():
                         canceled = True
@@ -1739,7 +2001,10 @@ def process_queue():
                             item['current_image_path'] = None
                         break
 
-                    result_text = read_result_text(file_output_dir, result_file)
+                    if isinstance(infer_result, str) and infer_result:
+                        result_text = infer_result
+                    else:
+                        result_text = read_result_text(file_output_dir, result_file)
 
                 if result_text is None:
                     result_text = ''

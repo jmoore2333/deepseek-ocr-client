@@ -13,6 +13,7 @@ const PYTHON_SERVER_PORT = 5000;
 const PYTHON_SERVER_URL = `http://127.0.0.1:${PYTHON_SERVER_PORT}`;
 const TORCH_PRIMARY_PACKAGES = ['torch>=2.6.0', 'torchvision>=0.21.0', 'torchaudio>=2.6.0'];
 const TORCH_FALLBACK_PACKAGES = ['torch>=2.4.0', 'torchvision>=0.19.0', 'torchaudio>=2.4.0'];
+const MLX_PACKAGES = ['mlx', 'mlx-vlm>=0.3.0'];
 const INPUT_MIME_TYPES = {
   '.jpg': 'image/jpeg',
   '.jpeg': 'image/jpeg',
@@ -572,8 +573,8 @@ function findStandalonePython(pythonInstallDir) {
 function detectGpuTarget() {
   if (process.platform === 'darwin' && process.arch === 'arm64') {
     return {
-      id: 'mps',
-      displayName: 'Apple Silicon (MPS)',
+      id: 'mlx',
+      displayName: 'Apple Silicon (MLX)',
       torchIndexUrl: null
     };
   }
@@ -638,6 +639,35 @@ async function installTorchWithFallback(uvBinary, venvPython, gpuTarget, setupEn
     fallbackArgs.push('--index-url', gpuTarget.torchIndexUrl);
   }
   await runCommand(uvBinary, fallbackArgs, { env: setupEnv, logPrefix: '[setup] ' });
+}
+
+async function installMlxDependencies(uvBinary, venvPython, setupEnv) {
+  await runCommand(
+    uvBinary,
+    ['pip', 'install', '--python', venvPython, ...MLX_PACKAGES],
+    { env: setupEnv, logPrefix: '[setup] ' }
+  );
+}
+
+async function installModelFrameworkDependencies(uvBinary, venvPython, gpuTarget, setupEnv) {
+  if (gpuTarget.id === 'mlx') {
+    await installMlxDependencies(uvBinary, venvPython, setupEnv);
+    return;
+  }
+  await installTorchWithFallback(uvBinary, venvPython, gpuTarget, setupEnv);
+}
+
+function getRuntimeVerifySnippet(gpuTarget) {
+  if (gpuTarget.id === 'mlx') {
+    return [
+      'import flask, flask_cors, PIL, transformers, pypdfium2, mlx_vlm',
+      'print("runtime=mlx")'
+    ].join('; ');
+  }
+  return [
+    'import flask, flask_cors, PIL, transformers, torch, pypdfium2',
+    'print(f"runtime=torch torch={torch.__version__}")'
+  ].join('; ');
 }
 
 async function installNonTorchDependencies(uvBinary, venvPython, requirementsFile, pythonEnvRoot, setupEnv) {
@@ -728,7 +758,7 @@ async function setupPythonEnvironmentWithUv(paths) {
   );
 
   setStartupStatus('setup-install-deps', 'Installing Python dependencies...', 65);
-  await installTorchWithFallback(uvBinary, paths.venvPython, gpuTarget, setupEnv);
+  await installModelFrameworkDependencies(uvBinary, paths.venvPython, gpuTarget, setupEnv);
   await installNonTorchDependencies(
     uvBinary,
     paths.venvPython,
@@ -740,7 +770,7 @@ async function setupPythonEnvironmentWithUv(paths) {
   setStartupStatus('setup-verify', 'Verifying runtime environment...', 90);
   await runCommand(
     paths.venvPython,
-    ['-c', 'import flask, flask_cors, PIL, transformers, torch, pypdfium2; print(f"torch={torch.__version__}")'],
+    ['-c', getRuntimeVerifySnippet(gpuTarget)],
     { env: setupEnv, logPrefix: '[setup] ' }
   );
 
@@ -755,6 +785,7 @@ async function setupPythonEnvironmentWithUv(paths) {
     requirements_hash: requirementsHash,
     gpu_target: gpuTarget.id,
     gpu_display: gpuTarget.displayName,
+    runtime_backend: gpuTarget.id === 'mlx' ? 'mlx' : 'torch',
     uv_version: uvVersion,
     python_executable: paths.venvPython,
     updated_at: formatLocalTimestamp()

@@ -7,7 +7,10 @@ This project is unaffiliated with DeepSeek.
 ## What This Fork Adds
 
 - Managed first-run runtime via bundled `uv` (packaged builds)
-- Hardware-aware setup path (Apple Silicon MPS, NVIDIA CUDA, CPU)
+- Hardware-aware setup path (Apple Silicon MLX, NVIDIA CUDA, CPU)
+- Dual inference backends:
+  - Apple Silicon: `mlx` + `mlx-vlm` with `mlx-community/DeepSeek-OCR-2-8bit`
+  - Windows/Linux/Intel macOS: PyTorch backend (`torch` + `transformers`)
 - Queue processing for mixed image + PDF inputs
 - Queue controls: pause, resume, cancel, retry failed
 - PDF page-range support (`1-3,5`) for single OCR and queue OCR
