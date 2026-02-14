@@ -21,7 +21,7 @@
     "ocr",
     "deepseek"
   ],
-  "author": "",
+  "author": "Jeremy Moore <jamoore@gmail.com>",
   "license": "MIT",
   "devDependencies": {
     "@playwright/test": "^1.51.1",
@@ -87,6 +87,7 @@
     },
     "linux": {
       "icon": "assets/icons/icon.png",
+      "maintainer": "Jeremy Moore <jamoore@gmail.com>",
       "target": [
         "AppImage",
         "deb"
