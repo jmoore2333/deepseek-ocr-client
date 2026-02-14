@@ -19,7 +19,12 @@ bash "$SCRIPT_DIR/download-uv.sh"
 echo ""
 
 echo "=== Step 2/3: Installing Node dependencies ==="
-npm install
+if [[ -d "$PROJECT_ROOT/node_modules" && "${FORCE_NPM_INSTALL:-0}" != "1" ]]; then
+  echo "Found existing node_modules; skipping npm install."
+  echo "Set FORCE_NPM_INSTALL=1 to force reinstall."
+else
+  npm install
+fi
 echo ""
 
 OS="$(uname -s)"
@@ -33,7 +38,17 @@ else
 fi
 
 echo "=== Step 3/3: Building installer artifacts ($BUILD_CMD) ==="
-npm run "$BUILD_CMD"
+export CSC_IDENTITY_AUTO_DISCOVERY=false
+export ELECTRON_BUILDER_CACHE="${ELECTRON_BUILDER_CACHE:-$PROJECT_ROOT/.cache/electron-builder}"
+mkdir -p "$ELECTRON_BUILDER_CACHE"
+if [[ "$OS" == "Linux" ]]; then
+  LINUX_TARGETS="${LINUX_TARGETS:-AppImage deb}"
+  read -r -a LINUX_TARGET_ARGS <<< "$LINUX_TARGETS"
+  echo "Linux targets: $LINUX_TARGETS"
+  npm exec electron-builder -- --linux "${LINUX_TARGET_ARGS[@]}"
+else
+  npm run "$BUILD_CMD"
+fi
 echo ""
 
 echo "Build complete."
