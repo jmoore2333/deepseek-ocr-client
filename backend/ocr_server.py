@@ -21,6 +21,11 @@ from datetime import datetime
 from threading import Thread, Lock, Event
 from pathlib import Path
 
+# Linux CUDA fragmentation mitigation.
+# Must be configured before importing torch.
+if platform.system() == 'Linux':
+    os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
+
 TORCH_IMPORT_ERROR = None
 try:
     import torch
@@ -49,6 +54,20 @@ except Exception as exc:  # pragma: no cover - depends on runtime platform/env.
 
 # Reduce noisy tokenizers fork warnings from child process startup/log streaming.
 os.environ.setdefault('TOKENIZERS_PARALLELISM', 'false')
+
+
+def parse_env_flag(value, default=False):
+    if value is None:
+        return default
+    return str(value).strip().lower() in ('1', 'true', 'yes', 'on')
+
+
+# Linux default: skip torch.compile unless explicitly enabled, to avoid
+# platform-specific mixed-precision runtime issues.
+TORCH_COMPILE_ENABLED = parse_env_flag(
+    os.environ.get('DEEPSEEK_OCR_ENABLE_TORCH_COMPILE'),
+    default=(platform.system() != 'Linux')
+)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -550,35 +569,144 @@ def run_model_infer_mlx(**kwargs):
     return extract_text_from_mlx_output(generated)
 
 
+def is_cuda_oom_error(exc):
+    text = str(exc or '').lower()
+    return 'cuda out of memory' in text or ('out of memory' in text and 'cuda' in text)
+
+
+def is_cuda_dtype_mismatch_error(exc):
+    text = str(exc or '').lower()
+    return (
+        'masked_scatter_' in text and
+        'same dtypes' in text and
+        'half' in text and
+        'float' in text
+    )
+
+
+# ---------------------------------------------------------------------------
+# Pre-Ampere CUDA vision-encoder dtype fix
+# ---------------------------------------------------------------------------
+# The upstream DeepSeek-OCR-2 model hardcodes
+#   torch.autocast("cuda", dtype=torch.bfloat16)
+# inside its infer() method.  On pre-Ampere GPUs (Compute < 8.0) that lack
+# native bfloat16 support, autocast silently falls back to float32 for many
+# vision-encoder ops while the language model embeddings stay in float16.
+# This causes a dtype mismatch at the masked_scatter_ call inside the model's
+# forward(), which requires self and source to share a dtype.
+#
+# The fix: during the model's inner forward pass, temporarily replace
+# torch.Tensor.masked_scatter_ with a wrapper that casts the source tensor
+# to match the target dtype.  The wrapper is only active for the duration of
+# the forward call and is protected by inference_lock, so it is thread-safe.
+# This patch is applied on any OS when CUDA compute capability < 8.0.
+# On Ampere+ GPUs (Compute >= 8.0) bfloat16 is natively supported and the
+# upstream autocast works correctly, so no patch is needed.
+# ---------------------------------------------------------------------------
+
+_CUDA_DTYPE_FIX_APPLIED = False
+
+
+def _apply_cuda_vision_dtype_fix(model_obj):
+    """Monkey-patch model forward to fix vision-encoder dtype mismatch on pre-Ampere CUDA.
+
+    Returns True if the patch was applied, False otherwise.
+    """
+    global _CUDA_DTYPE_FIX_APPLIED
+    if _CUDA_DTYPE_FIX_APPLIED:
+        return True
+
+    inner = getattr(model_obj, 'model', None)
+    if inner is None:
+        logger.warning("Cannot apply CUDA vision dtype fix: model.model not found")
+        return False
+
+    original_forward = inner.forward  # bound method
+
+    @functools.wraps(original_forward)
+    def _patched_forward(*args, **kwargs):
+        _orig_masked_scatter = torch.Tensor.masked_scatter_
+
+        def _dtype_safe_masked_scatter(self_tensor, mask, source):
+            if source.dtype != self_tensor.dtype:
+                source = source.to(self_tensor.dtype)
+            return _orig_masked_scatter(self_tensor, mask, source)
+
+        torch.Tensor.masked_scatter_ = _dtype_safe_masked_scatter
+        try:
+            return original_forward(*args, **kwargs)
+        finally:
+            torch.Tensor.masked_scatter_ = _orig_masked_scatter
+
+    inner.forward = _patched_forward
+    _CUDA_DTYPE_FIX_APPLIED = True
+    logger.info(
+        "Applied pre-Ampere CUDA vision dtype fix "
+        "(auto-cast masked_scatter_ source dtype during forward pass)"
+    )
+    return True
+
+
+def get_cuda_memory_snapshot():
+    if torch is None or device != 'cuda' or not torch.cuda.is_available():
+        return None
+    try:
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+        return {
+            'free_bytes': int(free_bytes),
+            'total_bytes': int(total_bytes),
+            'allocated_bytes': int(torch.cuda.memory_allocated()),
+            'reserved_bytes': int(torch.cuda.memory_reserved())
+        }
+    except Exception:
+        return None
+
+
+def format_cuda_memory_snapshot(snapshot):
+    if not snapshot:
+        return 'unavailable'
+    mib = 1024 * 1024
+    return (
+        f"free={snapshot['free_bytes'] / mib:.1f} MiB, "
+        f"total={snapshot['total_bytes'] / mib:.1f} MiB, "
+        f"allocated={snapshot['allocated_bytes'] / mib:.1f} MiB, "
+        f"reserved={snapshot['reserved_bytes'] / mib:.1f} MiB"
+    )
+
+
 def run_model_infer_torch(**kwargs):
     """Run torch-backed model inference with device arguments when supported by the model."""
     global model, tokenizer, device, dtype
     max_new_tokens_cap = resolve_max_new_tokens_cap(kwargs.pop('max_new_tokens_cap', None))
+    host_os = platform.system()
 
-    def invoke_infer():
+    def invoke_infer(infer_kwargs, token_cap, prefer_explicit_device_dtype=False):
         logger.info(
             "Inference settings: device=%s eval_mode=%s max_new_tokens_cap=%s base_size=%s image_size=%s crop_mode=%s",
             device,
-            bool(kwargs.get('eval_mode', False)),
-            max_new_tokens_cap,
-            kwargs.get('base_size'),
-            kwargs.get('image_size'),
-            kwargs.get('crop_mode')
+            bool(infer_kwargs.get('eval_mode', False)),
+            token_cap,
+            infer_kwargs.get('base_size'),
+            infer_kwargs.get('image_size'),
+            infer_kwargs.get('crop_mode')
         )
-        if device == 'cuda':
-            return model.infer(tokenizer, **kwargs)
+        if device == 'cuda' and not prefer_explicit_device_dtype:
+            return model.infer(tokenizer, **infer_kwargs)
         try:
-            return model.infer(tokenizer, device=torch.device(device), dtype=dtype, **kwargs)
+            return model.infer(tokenizer, device=torch.device(device), dtype=dtype, **infer_kwargs)
         except TypeError:
             logger.warning("Model infer() does not accept explicit device/dtype, retrying default call")
-            return model.infer(tokenizer, **kwargs)
+            return model.infer(tokenizer, **infer_kwargs)
 
-    def invoke_with_guards():
+    def invoke_with_guards(infer_kwargs, token_cap, prefer_explicit_device_dtype=False):
         with inference_lock:
-            return invoke_infer_with_generation_cap(invoke_infer, max_new_tokens_cap)
+            return invoke_infer_with_generation_cap(
+                lambda: invoke_infer(infer_kwargs, token_cap, prefer_explicit_device_dtype),
+                token_cap
+            )
 
     try:
-        return invoke_with_guards()
+        return invoke_with_guards(kwargs, max_new_tokens_cap)
     except RuntimeError as exc:
         # Guard against a known MPS race where inference starts before the model
         # has finished transitioning to the MPS device.
@@ -586,19 +714,99 @@ def run_model_infer_torch(**kwargs):
             device == 'mps' and
             'Placeholder storage has not been allocated on MPS device' in str(exc)
         )
-        if not is_mps_placeholder_error:
+        if is_mps_placeholder_error:
+            logger.warning(
+                "Encountered MPS placeholder storage error; waiting for model readiness and retrying once"
+            )
+            ready, load_error = wait_for_model_ready(timeout_seconds=240, poll_seconds=0.25)
+            if not ready:
+                logger.warning(f"Model did not become ready before retry: {load_error}")
+                raise
+
+            logger.info("Retrying inference after model readiness confirmed on MPS")
+            return invoke_with_guards(kwargs, max_new_tokens_cap)
+
+        is_linux_cuda_dtype_mismatch = (
+            host_os == 'Linux' and
+            device == 'cuda' and
+            is_cuda_dtype_mismatch_error(exc)
+        )
+        if is_linux_cuda_dtype_mismatch:
+            logger.warning("Linux CUDA dtype mismatch detected: %s", exc)
+            logger.warning(
+                "Retrying Linux CUDA inference with explicit device/dtype binding "
+                "(dtype=%s) to align tensor types",
+                dtype
+            )
+            clear_cuda_cache()
+            try:
+                return invoke_with_guards(
+                    kwargs,
+                    max_new_tokens_cap,
+                    prefer_explicit_device_dtype=True
+                )
+            except RuntimeError as dtype_retry_exc:
+                if is_cuda_dtype_mismatch_error(dtype_retry_exc):
+                    raise RuntimeError(
+                        "Linux CUDA dtype mismatch persisted after retry. "
+                        "Set DEEPSEEK_OCR_ENABLE_TORCH_COMPILE=0, lower Base/Size, "
+                        "or run with DEVICE=cpu."
+                    ) from dtype_retry_exc
+                raise
+
+        # Linux-only CUDA OOM recovery path.
+        # Keep Windows/macOS behavior unchanged.
+        is_linux_cuda_oom = (
+            host_os == 'Linux' and
+            device == 'cuda' and
+            is_cuda_oom_error(exc)
+        )
+        if not is_linux_cuda_oom:
             raise
+
+        logger.warning("Linux CUDA OOM detected: %s", exc)
+        logger.warning("CUDA memory snapshot before recovery: %s", format_cuda_memory_snapshot(get_cuda_memory_snapshot()))
+        clear_cuda_cache()
+
+        if not LINUX_CUDA_OOM_RETRY_ENABLED:
+            raise RuntimeError(
+                "Linux CUDA out of memory. Set smaller Base/Size, disable Crop, "
+                "or set DEVICE=cpu for this run."
+            ) from exc
+
+        retry_kwargs = dict(kwargs)
+        retry_kwargs['base_size'] = min(
+            max(256, int(retry_kwargs.get('base_size', 1024))),
+            LINUX_CUDA_OOM_RETRY_BASE_SIZE_MAX
+        )
+        retry_kwargs['image_size'] = min(
+            max(256, int(retry_kwargs.get('image_size', 640))),
+            LINUX_CUDA_OOM_RETRY_IMAGE_SIZE_MAX
+        )
+        retry_kwargs['crop_mode'] = False
+        retry_cap = min(max_new_tokens_cap, LINUX_CUDA_OOM_RETRY_MAX_NEW_TOKENS)
 
         logger.warning(
-            "Encountered MPS placeholder storage error; waiting for model readiness and retrying once"
+            "Retrying Linux CUDA inference with conservative settings: "
+            "base_size=%s image_size=%s crop_mode=%s max_new_tokens_cap=%s",
+            retry_kwargs['base_size'],
+            retry_kwargs['image_size'],
+            retry_kwargs['crop_mode'],
+            retry_cap
         )
-        ready, load_error = wait_for_model_ready(timeout_seconds=240, poll_seconds=0.25)
-        if not ready:
-            logger.warning(f"Model did not become ready before retry: {load_error}")
-            raise
 
-        logger.info("Retrying inference after model readiness confirmed on MPS")
-        return invoke_with_guards()
+        try:
+            return invoke_with_guards(retry_kwargs, retry_cap)
+        except RuntimeError as retry_exc:
+            if is_cuda_oom_error(retry_exc):
+                clear_cuda_cache()
+                snapshot = format_cuda_memory_snapshot(get_cuda_memory_snapshot())
+                raise RuntimeError(
+                    "Linux CUDA out of memory after automatic retry. "
+                    f"Current CUDA memory snapshot: {snapshot}. "
+                    "Close other GPU processes, lower Base/Size, or run with DEVICE=cpu."
+                ) from retry_exc
+            raise
 
 
 def run_model_infer(**kwargs):
@@ -750,6 +958,12 @@ def load_model_background():
                 dtype = torch.float16
             model = model.cuda().to(dtype)
             logger.info(f"Model loaded on CUDA with dtype={dtype} (Compute {compute_cap[0]}.{compute_cap[1]})")
+
+            # The upstream model hardcodes torch.autocast("cuda",
+            # dtype=torch.bfloat16) which causes a Half/Float dtype mismatch
+            # on pre-Ampere GPUs.  Patch the forward pass to auto-cast.
+            if compute_cap[0] < 8:
+                _apply_cuda_vision_dtype_fix(model)
         elif device == 'mps':
             dtype = torch.float16
             model = model.to(torch.device('mps')).to(dtype)
@@ -762,10 +976,15 @@ def load_model_background():
         # Apply torch.compile on CUDA when available (95% progress).
         update_progress('loading', 'optimize', 'Optimizing model runtime...', 95)
         try:
-            if hasattr(torch, 'compile') and device == 'cuda':
+            if hasattr(torch, 'compile') and device == 'cuda' and TORCH_COMPILE_ENABLED:
                 logger.info("Applying torch.compile for faster inference...")
                 model = torch.compile(model, mode="reduce-overhead")
                 logger.info("Model compiled successfully for CUDA")
+            elif device == 'cuda' and not TORCH_COMPILE_ENABLED:
+                logger.info(
+                    "Skipping torch.compile on CUDA "
+                    "(set DEEPSEEK_OCR_ENABLE_TORCH_COMPILE=1 to enable)"
+                )
             else:
                 logger.info("torch.compile unavailable or unsupported for current device, skipping compilation")
         except Exception as e:
@@ -866,8 +1085,11 @@ def wait_for_model_ready(timeout_seconds=600, poll_seconds=0.5):
 def clear_cuda_cache():
     """Clear CUDA cache to free memory between processing"""
     if torch is not None and device == 'cuda' and torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        torch.cuda.ipc_collect()
+        try:
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+        except Exception as exc:
+            logger.debug(f"Unable to clear CUDA cache cleanly: {exc}")
 
 
 def run_model_infer_with_heartbeat(
@@ -993,6 +1215,19 @@ PDF_MAX_NEW_TOKENS = max(
 
 DEFAULT_MAX_NEW_TOKENS_MPS = max(256, int(os.environ.get('DEEPSEEK_OCR_MAX_NEW_TOKENS_MPS', '768')))
 DEFAULT_MAX_NEW_TOKENS_OTHER = max(256, int(os.environ.get('DEEPSEEK_OCR_MAX_NEW_TOKENS_OTHER', '2048')))
+LINUX_CUDA_OOM_RETRY_ENABLED = get_env_flag('DEEPSEEK_OCR_LINUX_CUDA_OOM_RETRY', True)
+LINUX_CUDA_OOM_RETRY_BASE_SIZE_MAX = max(
+    384,
+    int(os.environ.get('DEEPSEEK_OCR_LINUX_CUDA_OOM_RETRY_BASE_MAX', '640'))
+)
+LINUX_CUDA_OOM_RETRY_IMAGE_SIZE_MAX = max(
+    320,
+    int(os.environ.get('DEEPSEEK_OCR_LINUX_CUDA_OOM_RETRY_IMAGE_MAX', '512'))
+)
+LINUX_CUDA_OOM_RETRY_MAX_NEW_TOKENS = max(
+    128,
+    int(os.environ.get('DEEPSEEK_OCR_LINUX_CUDA_OOM_RETRY_MAX_NEW_TOKENS', '768'))
+)
 
 
 def get_input_suffix(filename):
@@ -1349,6 +1584,7 @@ def collect_runtime_diagnostics():
     output_cache_bytes = get_cache_dir_size(OUTPUT_DIR)
     total_cache_bytes = get_cache_dir_size(CACHE_DIR)
     disk_usage = shutil.disk_usage(CACHE_DIR if os.path.exists(CACHE_DIR) else os.path.expanduser('~'))
+    cuda_memory = get_cuda_memory_snapshot()
 
     return {
         'timestamp': datetime.now().astimezone().isoformat(),
@@ -1357,6 +1593,7 @@ def collect_runtime_diagnostics():
             'platform': platform.platform(),
             'pid': os.getpid(),
             'backend': RUNTIME_BACKEND,
+            'torch_compile_enabled': TORCH_COMPILE_ENABLED,
             'torch_available': is_torch_available(),
             'mlx_available': is_mlx_available(),
             'torch_import_error': TORCH_IMPORT_ERROR,
@@ -1371,7 +1608,8 @@ def collect_runtime_diagnostics():
             'dtype': str(dtype),
             'runtime_backend': RUNTIME_BACKEND,
             'gpu_target_hint': gpu_target_hint,
-            'gpu_target_device_hint': map_gpu_target_to_device(gpu_target_hint) if gpu_target_hint else None
+            'gpu_target_device_hint': map_gpu_target_to_device(gpu_target_hint) if gpu_target_hint else None,
+            'cuda_memory': cuda_memory
         },
         'cache': {
             'cache_dir': CACHE_DIR,
@@ -1395,9 +1633,11 @@ def health_check():
     gpu_target_hint = os.environ.get('DEEPSEEK_OCR_GPU_TARGET')
     preferred_device = get_preferred_device()
     model_ready = is_model_ready()
+    cuda_memory = get_cuda_memory_snapshot()
     return jsonify({
         'status': 'ok',
         'runtime_backend': RUNTIME_BACKEND,
+        'torch_compile_enabled': TORCH_COMPILE_ENABLED,
         'torch_available': is_torch_available(),
         'mlx_available': is_mlx_available(),
         'model_loaded': model_ready,
@@ -1408,7 +1648,8 @@ def health_check():
         'gpu_target_hint': gpu_target_hint,
         'gpu_target_device_hint': map_gpu_target_to_device(gpu_target_hint) if gpu_target_hint else None,
         'preferred_device': preferred_device,
-        'device_state': device
+        'device_state': device,
+        'cuda_memory': cuda_memory
     })
 
 @app.route('/progress', methods=['GET'])
@@ -1712,8 +1953,10 @@ def perform_ocr():
 def model_info():
     """Get information about the model"""
     gpu_target_hint = os.environ.get('DEEPSEEK_OCR_GPU_TARGET')
+    cuda_memory = get_cuda_memory_snapshot()
     return jsonify({
         'runtime_backend': RUNTIME_BACKEND,
+        'torch_compile_enabled': TORCH_COMPILE_ENABLED,
         'torch_available': is_torch_available(),
         'mlx_available': is_mlx_available(),
         'model_name': MODEL_NAME,
@@ -1725,7 +1968,8 @@ def model_info():
         'gpu_target_device_hint': map_gpu_target_to_device(gpu_target_hint) if gpu_target_hint else None,
         'preferred_device': get_preferred_device(),
         'device_state': device,
-        'gpu_name': torch.cuda.get_device_name(0) if (torch is not None and device == 'cuda' and torch.cuda.is_available()) else None
+        'gpu_name': torch.cuda.get_device_name(0) if (torch is not None and device == 'cuda' and torch.cuda.is_available()) else None,
+        'cuda_memory': cuda_memory
     })
 
 @app.route('/queue/add', methods=['POST'])
