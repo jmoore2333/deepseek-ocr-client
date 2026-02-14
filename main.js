@@ -926,8 +926,12 @@ async function startPythonServer() {
 
     backendCommand = pythonExecutable;
     backendArgs = [paths.backendScript];
+    const linuxCudaAllocatorEnv = process.platform === 'linux'
+      ? { PYTORCH_CUDA_ALLOC_CONF: process.env.PYTORCH_CUDA_ALLOC_CONF || 'expandable_segments:True' }
+      : {};
     backendEnv = {
       ...process.env,
+      ...linuxCudaAllocatorEnv,
       PYTHONUNBUFFERED: '1',
       DEEPSEEK_OCR_CACHE_DIR: paths.cacheRoot,
       DEEPSEEK_OCR_MODEL_CACHE_DIR: paths.modelCacheDir,
