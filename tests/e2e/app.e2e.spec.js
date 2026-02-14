@@ -103,6 +103,11 @@ test.describe('DeepSeek OCR Electron E2E', () => {
 
   test.beforeEach(async () => {
     fixtures = createFixtures();
+    const launchArgs = [APP_ROOT];
+    if (process.platform === 'linux') {
+      // CI runners can have sandbox restrictions that prevent Electron from booting.
+      launchArgs.push('--no-sandbox', '--disable-setuid-sandbox');
+    }
     const launchEnv = {
       ...process.env,
       DEEPSEEK_MOCK_BACKEND: '1',
@@ -112,7 +117,7 @@ test.describe('DeepSeek OCR Electron E2E', () => {
     delete launchEnv.ELECTRON_RUN_AS_NODE;
 
     electronApp = await electron.launch({
-      args: [APP_ROOT],
+      args: launchArgs,
       cwd: APP_ROOT,
       env: launchEnv
     });

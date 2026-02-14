@@ -26,13 +26,12 @@ function run(command, args, options = {}) {
   }
 }
 
-function getElectronBuilderCommand() {
-  const binName = process.platform === 'win32' ? 'electron-builder.cmd' : 'electron-builder';
-  const localBin = path.join(projectRoot, 'node_modules', '.bin', binName);
-  if (fs.existsSync(localBin)) {
-    return localBin;
-  }
-  return process.platform === 'win32' ? 'npx.cmd' : 'npx';
+function getElectronBuilderInvocation() {
+  const cliPath = path.join(projectRoot, 'node_modules', 'electron-builder', 'out', 'cli', 'cli.js');
+  return {
+    command: process.execPath,
+    args: [cliPath]
+  };
 }
 
 function getPlatformFlag() {
@@ -62,10 +61,7 @@ function assertUnpackedArtifact() {
 }
 
 console.log('[build-smoke] Running electron-builder --dir for current host platform...');
-const builderCommand = getElectronBuilderCommand();
-const builderArgs = builderCommand.endsWith('npx') || builderCommand.endsWith('npx.cmd')
-  ? ['electron-builder', '--dir', '--publish', 'never', getPlatformFlag()]
-  : ['--dir', '--publish', 'never', getPlatformFlag()];
-run(builderCommand, builderArgs);
+const builderInvocation = getElectronBuilderInvocation();
+run(builderInvocation.command, [...builderInvocation.args, '--dir', '--publish', 'never', getPlatformFlag()]);
 assertUnpackedArtifact();
 console.log('[build-smoke] Build smoke test passed.');
