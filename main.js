@@ -442,6 +442,7 @@ function getUvSetupEnv(paths) {
   return {
     ...process.env,
     UV_CACHE_DIR: paths.uvCacheDir,
+    UV_HTTP_TIMEOUT: process.env.UV_HTTP_TIMEOUT || '180',
     PIP_CACHE_DIR: paths.pipCacheDir
   };
 }

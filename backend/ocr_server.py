@@ -463,8 +463,8 @@ def extract_text_from_mlx_output(generated):
 
 
 GROUNDING_TOKEN_PATTERN = re.compile(
-    r'<\|ref\|>([^<]*)<\|/ref\|><\|det\|>\[\[([^\]]+)\]\]<\|/det\|>',
-    re.MULTILINE
+    r'<\|ref\|>(.*?)<\|/ref\|><\|det\|>\s*(\[\[.*?\]\])\s*<\|/det\|>',
+    re.DOTALL
 )
 
 
@@ -1210,7 +1210,7 @@ PDF_FAST_DISABLE_CROP = get_env_flag('DEEPSEEK_OCR_PDF_FAST_DISABLE_CROP', True)
 PDF_EVAL_MODE = get_env_flag('DEEPSEEK_OCR_PDF_EVAL_MODE', True)
 PDF_MAX_NEW_TOKENS = max(
     128,
-    int(os.environ.get('DEEPSEEK_OCR_PDF_MAX_NEW_TOKENS', '384' if PREFERRED_DEVICE_HINT == 'mps' else '1024'))
+    int(os.environ.get('DEEPSEEK_OCR_PDF_MAX_NEW_TOKENS', '1024'))
 )
 
 DEFAULT_MAX_NEW_TOKENS_MPS = max(256, int(os.environ.get('DEEPSEEK_OCR_MAX_NEW_TOKENS_MPS', '768')))
