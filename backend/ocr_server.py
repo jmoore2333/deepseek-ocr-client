@@ -10,12 +10,14 @@ import re
 import math
 import shutil
 import platform
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify, send_file, send_from_directory
 from flask_cors import CORS
 import tempfile
 import time
 import json
 import functools
+import io
+import textwrap
 from collections import deque
 from datetime import datetime
 from threading import Thread, Lock, Event
@@ -1333,6 +1335,167 @@ def combine_pdf_results(page_results, prompt_type, page_labels=None):
     return '\n\n'.join(chunks).strip()
 
 
+PAGE_MARKER_PATTERN = re.compile(
+    r'(?m)^\s*(?:#{1,6}\s*Page\s+(\d+)|---\s*Page\s+(\d+)\s*---)\s*$'
+)
+
+
+def normalize_searchable_text(text):
+    """Normalize OCR text for a PDF text layer without changing readable words."""
+    if not text:
+        return ''
+    normalized = str(text)
+    normalized = re.sub(r'<\|/?(?:ref|det)\|>', '', normalized)
+    normalized = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', ' ', normalized)
+    return normalized.strip()
+
+
+def extract_searchable_pdf_page_texts(result_text, page_labels=None, page_count=None):
+    """Extract page text chunks from combined PDF OCR output."""
+    text = str(result_text or '')
+    labels = [int(label) for label in page_labels or [] if str(label).strip()]
+    if not labels and page_count:
+        labels = list(range(1, int(page_count) + 1))
+
+    matches = list(PAGE_MARKER_PATTERN.finditer(text))
+    if not matches:
+        single = normalize_searchable_text(text)
+        if labels:
+            return [single if idx == 0 else '' for idx, _label in enumerate(labels)]
+        return [single] if single else []
+
+    by_label = {}
+    for idx, match in enumerate(matches):
+        label_text = match.group(1) or match.group(2)
+        if not label_text:
+            continue
+        start = match.end()
+        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
+        by_label[int(label_text)] = normalize_searchable_text(text[start:end])
+
+    if labels:
+        return [by_label.get(label, '') for label in labels]
+
+    return [by_label[label] for label in sorted(by_label)]
+
+
+def wrap_searchable_line(line, width_points, font_name, font_size):
+    """Wrap a text line conservatively for a reportlab PDF text object."""
+    try:
+        from reportlab.pdfbase.pdfmetrics import stringWidth
+    except Exception:
+        return textwrap.wrap(line, width=90) or ['']
+
+    max_width = max(20, width_points)
+    chunks = []
+    current = ''
+    for word in str(line or '').split():
+        candidate = word if not current else f'{current} {word}'
+        if stringWidth(candidate, font_name, font_size) <= max_width:
+            current = candidate
+            continue
+        if current:
+            chunks.append(current)
+        current = word
+    if current:
+        chunks.append(current)
+    return chunks or ['']
+
+
+def draw_invisible_text_layer(pdf_canvas, page_text, page_width, page_height):
+    """Add invisible, extractable OCR text over a rendered page image."""
+    cleaned = normalize_searchable_text(page_text)
+    if not cleaned:
+        return
+
+    margin = max(18, min(page_width, page_height) * 0.04)
+    usable_width = max(20, page_width - (margin * 2))
+    usable_height = max(20, page_height - (margin * 2))
+    raw_lines = cleaned.splitlines()
+    line_count = max(1, sum(max(1, len(wrap_searchable_line(line, usable_width, 'Helvetica', 8))) for line in raw_lines))
+    font_size = max(4, min(8, usable_height / max(line_count, 1) * 0.85))
+    leading = font_size * 1.2
+    max_lines = max(1, int(usable_height / leading))
+
+    text_obj = pdf_canvas.beginText()
+    text_obj.setTextOrigin(margin, page_height - margin)
+    text_obj.setFont('Helvetica', font_size)
+    if hasattr(text_obj, 'setTextRenderMode'):
+        text_obj.setTextRenderMode(3)
+
+    written = 0
+    for raw_line in raw_lines:
+        for wrapped in wrap_searchable_line(raw_line, usable_width, 'Helvetica', font_size):
+            if written >= max_lines:
+                break
+            text_obj.textLine(wrapped)
+            written += 1
+        if written >= max_lines:
+            break
+        if not raw_line.strip():
+            text_obj.textLine('')
+            written += 1
+
+    pdf_canvas.drawText(text_obj)
+
+
+def create_searchable_pdf(source_pdf_path, page_texts, output_pdf_path, page_labels=None, render_scale=2.0):
+    """Create a PDF with rendered source pages plus an invisible OCR text layer."""
+    try:
+        import pypdfium2 as pdfium
+        from reportlab.lib.utils import ImageReader
+        from reportlab.pdfgen import canvas
+    except Exception as exc:
+        raise RuntimeError('Searchable PDF export requires pypdfium2 and reportlab dependencies.') from exc
+
+    labels = [int(label) for label in page_labels or [] if str(label).strip()]
+    texts = list(page_texts or [])
+    if not labels:
+        labels = list(range(1, len(texts) + 1))
+    if len(texts) < len(labels):
+        texts.extend([''] * (len(labels) - len(texts)))
+    elif len(texts) > len(labels):
+        texts = texts[:len(labels)]
+
+    if not labels:
+        raise ValueError('No PDF pages selected for searchable export.')
+
+    source_pdf = pdfium.PdfDocument(source_pdf_path)
+    output = canvas.Canvas(output_pdf_path)
+    try:
+        page_count = len(source_pdf)
+        for label, page_text in zip(labels, texts):
+            if label < 1 or label > page_count:
+                raise ValueError(f'PDF page {label} is outside the source page range.')
+
+            page = source_pdf[label - 1]
+            page_width, page_height = page.get_size()
+            bitmap = page.render(scale=render_scale)
+            image = bitmap.to_pil()
+            image_buffer = io.BytesIO()
+            image.save(image_buffer, format='JPEG', quality=90, optimize=True)
+            image_buffer.seek(0)
+
+            output.setPageSize((page_width, page_height))
+            output.drawImage(
+                ImageReader(image_buffer),
+                0,
+                0,
+                width=page_width,
+                height=page_height,
+                preserveAspectRatio=False,
+                mask='auto',
+            )
+            draw_invisible_text_layer(output, page_text, page_width, page_height)
+            output.showPage()
+            page.close()
+    finally:
+        source_pdf.close()
+
+    output.save()
+    return output_pdf_path
+
+
 def parse_pdf_page_range(page_range_text, page_count):
     """Parse page-range syntax like '1-3,5,7-9' into sorted unique page numbers."""
     if page_count <= 0:
@@ -1805,6 +1968,7 @@ def perform_ocr():
                 'is_pdf': True,
                 'page_count': len(page_results),
                 'page_labels': selected_pages,
+                'page_texts': page_results,
                 'applied_settings': {
                     'base_size': pdf_profile['base_size'],
                     'image_size': pdf_profile['image_size'],
@@ -2593,6 +2757,72 @@ def serve_current_page_image():
     directory = os.path.dirname(os.path.abspath(image_path))
     filename = os.path.basename(image_path)
     return send_from_directory(directory, filename)
+
+
+@app.route('/searchable_pdf', methods=['POST'])
+def create_searchable_pdf_endpoint():
+    """Create a machine-readable PDF from a source PDF and OCR text."""
+    temp_input_path = None
+    temp_output_path = None
+    try:
+        if 'pdf' not in request.files:
+            return jsonify({'status': 'error', 'message': 'No PDF file provided'}), 400
+
+        input_file = request.files['pdf']
+        input_suffix = get_input_suffix(input_file.filename)
+        if input_suffix != '.pdf':
+            return jsonify({'status': 'error', 'message': 'Searchable export requires a PDF input'}), 400
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
+            input_file.save(tmp_file.name)
+            temp_input_path = tmp_file.name
+
+        page_labels = None
+        page_labels_json = request.form.get('page_labels_json', '').strip()
+        if page_labels_json:
+            page_labels = json.loads(page_labels_json)
+
+        page_texts = None
+        page_texts_json = request.form.get('page_texts_json', '').strip()
+        if page_texts_json:
+            parsed_texts = json.loads(page_texts_json)
+            if isinstance(parsed_texts, list):
+                page_texts = [str(value or '') for value in parsed_texts]
+
+        if page_texts is None:
+            result_text = request.form.get('result_text', '')
+            page_count_text = request.form.get('page_count', '').strip()
+            page_count = int(page_count_text) if page_count_text.isdigit() else None
+            page_texts = extract_searchable_pdf_page_texts(result_text, page_labels=page_labels, page_count=page_count)
+
+        if not page_texts:
+            return jsonify({'status': 'error', 'message': 'No OCR text available for searchable export'}), 400
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as output_file:
+            temp_output_path = output_file.name
+
+        create_searchable_pdf(temp_input_path, page_texts, temp_output_path, page_labels=page_labels)
+        with open(temp_output_path, 'rb') as f:
+            payload = f.read()
+
+        download_name = f"{Path(input_file.filename or 'ocr-output').stem}-searchable.pdf"
+        return send_file(
+            io.BytesIO(payload),
+            mimetype='application/pdf',
+            as_attachment=True,
+            download_name=download_name,
+        )
+    except Exception as exc:
+        logger.exception("Failed to create searchable PDF")
+        return jsonify({'status': 'error', 'message': str(exc)}), 500
+    finally:
+        for file_path in (temp_input_path, temp_output_path):
+            if file_path and os.path.exists(file_path):
+                try:
+                    os.remove(file_path)
+                except OSError:
+                    pass
+
 
 @app.route('/outputs/<path:filename>', methods=['GET'])
 def serve_output_file(filename):

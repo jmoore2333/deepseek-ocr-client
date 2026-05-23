@@ -44,6 +44,7 @@ contextBridge.exposeInMainWorld('appAPI', {
   runPreflightCheck: () => ipcRenderer.invoke('run-preflight-check'),
   exportDiagnostics: () => ipcRenderer.invoke('export-diagnostics'),
   saveDocumentZip: (markdownText) => ipcRenderer.invoke('save-document-zip', { markdownText }),
+  saveSearchablePdf: (payload) => ipcRenderer.invoke('save-searchable-pdf', payload),
 
   getRetentionPolicy: () => ipcRenderer.invoke('get-retention-policy'),
   updateRetentionPolicy: (policy) => ipcRenderer.invoke('update-retention-policy', policy),

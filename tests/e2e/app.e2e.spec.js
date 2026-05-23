@@ -187,6 +187,21 @@ test.describe('DeepSeek OCR Electron E2E', () => {
     });
     expect(pdfResult.success).toBeTruthy();
     expect(pdfResult.data.status).toBe('success');
+    expect(pdfResult.data.page_texts).toHaveLength(3);
+  });
+
+  test('shows searchable PDF save action after PDF OCR', async () => {
+    await window.evaluate(async (pdfPath) => {
+      if (typeof window.loadImage !== 'function') {
+        throw new Error('Renderer loadImage helper is unavailable');
+      }
+      await window.loadImage(pdfPath);
+    }, fixtures.pdfPath);
+
+    await window.locator('#ocr-btn').click();
+
+    await expect(window.locator('#download-searchable-pdf-btn')).toBeVisible();
+    await expect(window.locator('#download-searchable-pdf-btn')).toHaveText('Save Searchable PDF');
   });
 
   test('processes mixed queue and reports page progress detail', async () => {

@@ -330,7 +330,11 @@ const server = http.createServer(async (req, res) => {
         prompt_type: promptType,
         raw_tokens: rawTokens,
         is_pdf: isPdf,
-        page_count: pageCount
+        page_count: pageCount,
+        page_labels: isPdf ? ['1', '2', '3'] : [],
+        page_texts: isPdf
+          ? ['Mock PDF OCR output page 1.', 'Mock PDF OCR output page 2.', 'Mock PDF OCR output page 3.']
+          : []
       });
       return;
     }

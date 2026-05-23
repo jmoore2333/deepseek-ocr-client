@@ -7,6 +7,7 @@ const clearBtn = document.getElementById('clear-btn');
 const viewBoxesBtn = document.getElementById('view-boxes-btn');
 const viewTokensBtn = document.getElementById('view-tokens-btn');
 const downloadZipBtn = document.getElementById('download-zip-btn');
+const downloadSearchablePdfBtn = document.getElementById('download-searchable-pdf-btn');
 const ocrBtn = document.getElementById('ocr-btn');
 const ocrBtnText = document.getElementById('ocr-btn-text');
 const loadModelBtn = document.getElementById('load-model-btn');
@@ -115,6 +116,10 @@ let currentImagePath = null;
 let currentResultText = null;
 let currentRawTokens = null;
 let currentPromptType = null;
+let currentOcrPageTexts = null;
+let currentOcrPageLabels = null;
+let currentOcrPageCount = null;
+let currentOcrIsPdf = false;
 let isProcessing = false;
 let lastBoxCount = 0;
 
@@ -390,6 +395,7 @@ function setupEventListeners() {
 
     // Download zip
     downloadZipBtn.addEventListener('click', downloadZip);
+    downloadSearchablePdfBtn.addEventListener('click', downloadSearchablePdf);
 
     // Lightbox
     lightboxClose.addEventListener('click', closeLightbox);
@@ -650,8 +656,13 @@ async function loadImage(filePath) {
     progressInline.style.display = 'none';
     copyBtn.style.display = 'none';
     downloadZipBtn.style.display = 'none';
+    downloadSearchablePdfBtn.style.display = 'none';
     viewBoxesBtn.style.display = 'none';
     viewTokensBtn.style.display = 'none';
+    currentOcrPageTexts = null;
+    currentOcrPageLabels = null;
+    currentOcrPageCount = null;
+    currentOcrIsPdf = false;
 
     // Clear overlay boxes
     ocrBoxesOverlay.innerHTML = '';
@@ -668,6 +679,10 @@ function clearImage() {
     currentResultText = null;
     currentRawTokens = null;
     currentPromptType = null;
+    currentOcrPageTexts = null;
+    currentOcrPageLabels = null;
+    currentOcrPageCount = null;
+    currentOcrIsPdf = false;
     imagePreview.src = '';
     imagePreview.style.display = 'block';
     if (selectedFileLabel) {
@@ -688,6 +703,7 @@ function clearImage() {
     progressInline.style.display = 'none';
     copyBtn.style.display = 'none';
     downloadZipBtn.style.display = 'none';
+    downloadSearchablePdfBtn.style.display = 'none';
 
     // Clear overlay boxes
     ocrBoxesOverlay.innerHTML = '';
@@ -1262,6 +1278,10 @@ async function performOCR() {
 
             // Store raw tokens
             currentRawTokens = result.data.raw_tokens;
+            currentOcrIsPdf = Boolean(result.data.is_pdf);
+            currentOcrPageTexts = Array.isArray(result.data.page_texts) ? result.data.page_texts : null;
+            currentOcrPageLabels = Array.isArray(result.data.page_labels) ? result.data.page_labels : null;
+            currentOcrPageCount = Number(result.data.page_count || 0) || null;
 
             // Do a final render of all boxes with the complete token stream
             // This ensures any boxes that arrived after polling stopped are rendered
@@ -1300,6 +1320,12 @@ async function performOCR() {
                 downloadZipBtn.style.display = 'none';
             }
 
+            if (currentOcrIsPdf && isPdfPath(currentImagePath)) {
+                downloadSearchablePdfBtn.style.display = 'inline-block';
+            } else {
+                downloadSearchablePdfBtn.style.display = 'none';
+            }
+
             // Show raw tokens button and boxes button if raw tokens exist
             if (currentRawTokens && uiMode === 'advanced') {
                 viewTokensBtn.style.display = 'inline-block';
@@ -1322,6 +1348,7 @@ async function performOCR() {
             resultsContent.innerHTML = `<p class="error">Error: ${result.error}</p>`;
             copyBtn.style.display = 'none';
             downloadZipBtn.style.display = 'none';
+            downloadSearchablePdfBtn.style.display = 'none';
             viewBoxesBtn.style.display = 'none';
             viewTokensBtn.style.display = 'none';
             showMessage(`OCR failed: ${result.error}`, 'error');
@@ -1339,6 +1366,7 @@ async function performOCR() {
         resultsContent.innerHTML = `<p class="error">Error: ${error.message}</p>`;
         copyBtn.style.display = 'none';
         downloadZipBtn.style.display = 'none';
+        downloadSearchablePdfBtn.style.display = 'none';
         viewBoxesBtn.style.display = 'none';
         viewTokensBtn.style.display = 'none';
         showMessage(`Error: ${error.message}`, 'error');
@@ -1427,6 +1455,47 @@ async function downloadZip() {
         showMessage('Failed to save ZIP file', 'error');
         downloadZipBtn.textContent = 'Download ZIP';
         downloadZipBtn.disabled = false;
+    }
+}
+
+async function downloadSearchablePdf() {
+    if (!currentImagePath || !isPdfPath(currentImagePath) || !currentResultText || !currentOcrIsPdf) {
+        showMessage('No PDF OCR result to save', 'error');
+        return;
+    }
+
+    try {
+        const originalText = downloadSearchablePdfBtn.textContent;
+        downloadSearchablePdfBtn.textContent = 'Saving PDF...';
+        downloadSearchablePdfBtn.disabled = true;
+
+        const result = await api.saveSearchablePdf({
+            sourcePdfPath: currentImagePath,
+            resultText: currentResultText,
+            pageTexts: currentOcrPageTexts,
+            pageLabels: currentOcrPageLabels,
+            pageCount: currentOcrPageCount
+        });
+
+        if (result.success) {
+            downloadSearchablePdfBtn.textContent = 'Saved';
+            showMessage(`Searchable PDF saved: ${result.filePath}`, 'success');
+        } else if (result.canceled) {
+            downloadSearchablePdfBtn.textContent = originalText;
+        } else {
+            downloadSearchablePdfBtn.textContent = originalText;
+            showMessage(`Failed to save searchable PDF: ${result.error || 'Unknown error'}`, 'error');
+        }
+
+        setTimeout(() => {
+            downloadSearchablePdfBtn.textContent = originalText;
+            downloadSearchablePdfBtn.disabled = false;
+        }, 1200);
+    } catch (error) {
+        console.error('Error saving searchable PDF:', error);
+        showMessage('Failed to save searchable PDF', 'error');
+        downloadSearchablePdfBtn.textContent = 'Save Searchable PDF';
+        downloadSearchablePdfBtn.disabled = false;
     }
 }
 

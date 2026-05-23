@@ -18,6 +18,7 @@ this app is designed for that exact flow.
 
 It gives you one desktop surface for:
 - image and PDF OCR
+- searchable PDF export after PDF OCR
 - queue/batch processing
 - live detection overlays
 - setup diagnostics and retention controls
@@ -38,7 +39,7 @@ It gives you one desktop surface for:
 4. Keep `Type = Document` unless you need a different mode.
 5. Click `Run OCR`.
 6. Review output in `Output Inspector`.
-7. Use `Copy to Clipboard` or `Download ZIP`.
+7. Use `Copy to Clipboard`, `Download ZIP`, or `Save Searchable PDF` for PDF inputs.
 
 ![Quick start panel](docs/images/ui-quickstart-basic.png)
 
