@@ -1,6 +1,6 @@
 {
   "name": "deepseek-ocr-client",
-  "version": "2.0.1",
+  "version": "2.0.2",
   "description": "Electron GUI for DeepSeek-OCR-2",
   "main": "main.js",
   "scripts": {

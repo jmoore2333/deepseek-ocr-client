@@ -1170,6 +1170,43 @@ async function saveDocumentZip(markdownText) {
   return { success: true, filePath: saveResult.filePath, imageCount: imageNames.length };
 }
 
+async function saveSearchablePdf({ sourcePdfPath, pageLabels }) {
+  if (!sourcePdfPath || path.extname(sourcePdfPath).toLowerCase() !== '.pdf' || !fs.existsSync(sourcePdfPath)) {
+    return { success: false, error: 'A source PDF is required for searchable export.' };
+  }
+
+  const sourceName = path.basename(sourcePdfPath, path.extname(sourcePdfPath));
+  const saveResult = await dialog.showSaveDialog(mainWindow, {
+    title: 'Save Searchable PDF',
+    defaultPath: path.join(app.getPath('downloads'), `${sourceName}-searchable.pdf`),
+    filters: [{ name: 'PDF Document', extensions: ['pdf'] }]
+  });
+  if (saveResult.canceled || !saveResult.filePath) {
+    return { success: false, canceled: true };
+  }
+
+  const FormData = require('form-data');
+  const formData = new FormData();
+  formData.append('pdf', fs.readFileSync(sourcePdfPath), {
+    filename: path.basename(sourcePdfPath),
+    contentType: 'application/pdf'
+  });
+  if (Array.isArray(pageLabels)) {
+    formData.append('page_labels_json', JSON.stringify(pageLabels));
+  }
+
+  const response = await axios.post(`${PYTHON_SERVER_URL}/searchable_pdf`, formData, {
+    headers: formData.getHeaders(),
+    maxContentLength: Infinity,
+    maxBodyLength: Infinity,
+    responseType: 'arraybuffer',
+    timeout: 0
+  });
+
+  fs.writeFileSync(saveResult.filePath, Buffer.from(response.data));
+  return { success: true, filePath: saveResult.filePath };
+}
+
 // IPC Handlers
 ipcMain.handle('check-server-status', async () => {
   try {
@@ -1474,6 +1511,14 @@ ipcMain.handle('save-document-zip', async (event, { markdownText }) => {
     return await saveDocumentZip(markdownText || '');
   } catch (error) {
     return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('save-searchable-pdf', async (event, payload) => {
+  try {
+    return await saveSearchablePdf(payload || {});
+  } catch (error) {
+    return { success: false, error: error.response?.data?.message || error.message };
   }
 });
 
