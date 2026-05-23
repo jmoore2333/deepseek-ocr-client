@@ -1170,7 +1170,7 @@ async function saveDocumentZip(markdownText) {
   return { success: true, filePath: saveResult.filePath, imageCount: imageNames.length };
 }
 
-async function saveSearchablePdf({ sourcePdfPath, resultText, pageTexts, pageLabels, pageCount }) {
+async function saveSearchablePdf({ sourcePdfPath, pageLabels }) {
   if (!sourcePdfPath || path.extname(sourcePdfPath).toLowerCase() !== '.pdf' || !fs.existsSync(sourcePdfPath)) {
     return { success: false, error: 'A source PDF is required for searchable export.' };
   }
@@ -1191,15 +1191,8 @@ async function saveSearchablePdf({ sourcePdfPath, resultText, pageTexts, pageLab
     filename: path.basename(sourcePdfPath),
     contentType: 'application/pdf'
   });
-  formData.append('result_text', resultText || '');
-  if (Array.isArray(pageTexts)) {
-    formData.append('page_texts_json', JSON.stringify(pageTexts));
-  }
   if (Array.isArray(pageLabels)) {
     formData.append('page_labels_json', JSON.stringify(pageLabels));
-  }
-  if (pageCount) {
-    formData.append('page_count', String(pageCount));
   }
 
   const response = await axios.post(`${PYTHON_SERVER_URL}/searchable_pdf`, formData, {

@@ -77,6 +77,7 @@ You can override the model with `MODEL_NAME` if needed.
 
 - First-run managed runtime setup with bundled `uv`
 - Hardware-aware environment provisioning
+- Position-aware searchable PDF export when Tesseract OCR is available
 - Startup status and preflight estimator
 - Diagnostics export (`ZIP`)
 - Retention policies for outputs/cache
@@ -153,6 +154,9 @@ npm run dist:linux
 - Setup stuck or failing:
   - Run `Run Preflight`
   - Check internet/disk availability
+- Searchable PDF export fails or search highlights are misaligned:
+  - Install Tesseract OCR (`brew install tesseract` on macOS).
+  - The app uses Tesseract's positioned PDF output for searchable exports so search highlights line up with scanned page images.
 - Windows build script behavior for `winCodeSign` symlink restrictions:
   - `.\scripts\build-release.ps1` now auto-falls back to a compatibility build mode when the shell cannot create symlinks.
   - Compatibility mode disables executable editing/signing (`signAndEditExecutable=false`), so installer output works but EXE icon/version metadata can differ.

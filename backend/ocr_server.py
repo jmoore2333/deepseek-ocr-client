@@ -10,6 +10,7 @@ import re
 import math
 import shutil
 import platform
+import subprocess
 from flask import Flask, request, jsonify, send_file, send_from_directory
 from flask_cors import CORS
 import tempfile
@@ -17,7 +18,6 @@ import time
 import json
 import functools
 import io
-import textwrap
 from collections import deque
 from datetime import datetime
 from threading import Thread, Lock, Event
@@ -1335,164 +1335,129 @@ def combine_pdf_results(page_results, prompt_type, page_labels=None):
     return '\n\n'.join(chunks).strip()
 
 
-PAGE_MARKER_PATTERN = re.compile(
-    r'(?m)^\s*(?:#{1,6}\s*Page\s+(\d+)|---\s*Page\s+(\d+)\s*---)\s*$'
-)
-
-
-def normalize_searchable_text(text):
-    """Normalize OCR text for a PDF text layer without changing readable words."""
-    if not text:
-        return ''
-    normalized = str(text)
-    normalized = re.sub(r'<\|/?(?:ref|det)\|>', '', normalized)
-    normalized = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', ' ', normalized)
-    return normalized.strip()
-
-
-def extract_searchable_pdf_page_texts(result_text, page_labels=None, page_count=None):
-    """Extract page text chunks from combined PDF OCR output."""
-    text = str(result_text or '')
-    labels = [int(label) for label in page_labels or [] if str(label).strip()]
-    if not labels and page_count:
-        labels = list(range(1, int(page_count) + 1))
-
-    matches = list(PAGE_MARKER_PATTERN.finditer(text))
-    if not matches:
-        single = normalize_searchable_text(text)
-        if labels:
-            return [single if idx == 0 else '' for idx, _label in enumerate(labels)]
-        return [single] if single else []
-
-    by_label = {}
-    for idx, match in enumerate(matches):
-        label_text = match.group(1) or match.group(2)
-        if not label_text:
-            continue
-        start = match.end()
-        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
-        by_label[int(label_text)] = normalize_searchable_text(text[start:end])
-
-    if labels:
-        return [by_label.get(label, '') for label in labels]
-
-    return [by_label[label] for label in sorted(by_label)]
-
-
-def wrap_searchable_line(line, width_points, font_name, font_size):
-    """Wrap a text line conservatively for a reportlab PDF text object."""
+def parse_positive_int(value, fallback, min_value=1, max_value=10000):
     try:
-        from reportlab.pdfbase.pdfmetrics import stringWidth
-    except Exception:
-        return textwrap.wrap(line, width=90) or ['']
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return fallback
+    return max(min_value, min(max_value, parsed))
 
-    max_width = max(20, width_points)
-    chunks = []
-    current = ''
-    for word in str(line or '').split():
-        candidate = word if not current else f'{current} {word}'
-        if stringWidth(candidate, font_name, font_size) <= max_width:
-            current = candidate
+
+def find_tesseract_executable():
+    """Find Tesseract even when a packaged macOS app is launched without shell PATH."""
+    candidates = []
+    env_path = os.environ.get('TESSERACT_CMD') or os.environ.get('TESSERACT_PATH')
+    if env_path:
+        candidates.append(env_path)
+
+    path_match = shutil.which('tesseract')
+    if path_match:
+        candidates.append(path_match)
+
+    candidates.extend([
+        '/opt/homebrew/bin/tesseract',
+        '/usr/local/bin/tesseract',
+        '/usr/bin/tesseract',
+    ])
+
+    seen = set()
+    for candidate in candidates:
+        if not candidate or candidate in seen:
             continue
-        if current:
-            chunks.append(current)
-        current = word
-    if current:
-        chunks.append(current)
-    return chunks or ['']
+        seen.add(candidate)
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
 
 
-def draw_invisible_text_layer(pdf_canvas, page_text, page_width, page_height):
-    """Add invisible, extractable OCR text over a rendered page image."""
-    cleaned = normalize_searchable_text(page_text)
-    if not cleaned:
-        return
-
-    margin = max(18, min(page_width, page_height) * 0.04)
-    usable_width = max(20, page_width - (margin * 2))
-    usable_height = max(20, page_height - (margin * 2))
-    raw_lines = cleaned.splitlines()
-    line_count = max(1, sum(max(1, len(wrap_searchable_line(line, usable_width, 'Helvetica', 8))) for line in raw_lines))
-    font_size = max(4, min(8, usable_height / max(line_count, 1) * 0.85))
-    leading = font_size * 1.2
-    max_lines = max(1, int(usable_height / leading))
-
-    text_obj = pdf_canvas.beginText()
-    text_obj.setTextOrigin(margin, page_height - margin)
-    text_obj.setFont('Helvetica', font_size)
-    if hasattr(text_obj, 'setTextRenderMode'):
-        text_obj.setTextRenderMode(3)
-
-    written = 0
-    for raw_line in raw_lines:
-        for wrapped in wrap_searchable_line(raw_line, usable_width, 'Helvetica', font_size):
-            if written >= max_lines:
-                break
-            text_obj.textLine(wrapped)
-            written += 1
-        if written >= max_lines:
-            break
-        if not raw_line.strip():
-            text_obj.textLine('')
-            written += 1
-
-    pdf_canvas.drawText(text_obj)
+def normalize_page_labels(page_labels, page_count):
+    labels = [int(label) for label in page_labels or [] if str(label).strip()]
+    if not labels:
+        labels = list(range(1, page_count + 1))
+    for label in labels:
+        if label < 1 or label > page_count:
+            raise ValueError(f'PDF page {label} is outside the source page range.')
+    return labels
 
 
-def create_searchable_pdf(source_pdf_path, page_texts, output_pdf_path, page_labels=None, render_scale=2.0):
-    """Create a PDF with rendered source pages plus an invisible OCR text layer."""
+def create_searchable_pdf(source_pdf_path, output_pdf_path, page_labels=None, dpi=None, language=None, psm=None):
+    """Create a searchable PDF with word positions generated by Tesseract."""
     try:
         import pypdfium2 as pdfium
-        from reportlab.lib.utils import ImageReader
-        from reportlab.pdfgen import canvas
+        from pypdf import PdfReader, PdfWriter
     except Exception as exc:
-        raise RuntimeError('Searchable PDF export requires pypdfium2 and reportlab dependencies.') from exc
+        raise RuntimeError('Searchable PDF export requires pypdfium2 and pypdf dependencies.') from exc
 
-    labels = [int(label) for label in page_labels or [] if str(label).strip()]
-    texts = list(page_texts or [])
-    if not labels:
-        labels = list(range(1, len(texts) + 1))
-    if len(texts) < len(labels):
-        texts.extend([''] * (len(labels) - len(texts)))
-    elif len(texts) > len(labels):
-        texts = texts[:len(labels)]
+    tesseract_cmd = find_tesseract_executable()
+    if not tesseract_cmd:
+        raise RuntimeError(
+            'Searchable PDF export requires Tesseract OCR. Install it with `brew install tesseract` '
+            'or set TESSERACT_CMD to the tesseract binary path.'
+        )
 
-    if not labels:
-        raise ValueError('No PDF pages selected for searchable export.')
+    dpi = parse_positive_int(
+        dpi if dpi is not None else os.environ.get('DEEPSEEK_OCR_SEARCHABLE_PDF_DPI'),
+        fallback=250,
+        min_value=120,
+        max_value=600,
+    )
+    language = (language or os.environ.get('DEEPSEEK_OCR_TESSERACT_LANG') or 'eng').strip() or 'eng'
+    psm_value = psm if psm is not None else os.environ.get('DEEPSEEK_OCR_TESSERACT_PSM', '6')
+    psm_value = str(psm_value).strip()
 
     source_pdf = pdfium.PdfDocument(source_pdf_path)
-    output = canvas.Canvas(output_pdf_path)
+    writer = PdfWriter()
     try:
-        page_count = len(source_pdf)
-        for label, page_text in zip(labels, texts):
-            if label < 1 or label > page_count:
-                raise ValueError(f'PDF page {label} is outside the source page range.')
+        labels = normalize_page_labels(page_labels, len(source_pdf))
+        render_scale = dpi / 72.0
+        with tempfile.TemporaryDirectory(prefix='deepseek-searchable-pdf-') as temp_dir:
+            temp_root = Path(temp_dir)
+            for item_idx, label in enumerate(labels, start=1):
+                page = source_pdf[label - 1]
+                image_path = temp_root / f'page-{item_idx:04d}.png'
+                output_base = temp_root / f'page-{item_idx:04d}'
+                try:
+                    image = page.render(scale=render_scale).to_pil().convert('RGB')
+                    image.save(image_path, format='PNG', dpi=(dpi, dpi))
 
-            page = source_pdf[label - 1]
-            page_width, page_height = page.get_size()
-            bitmap = page.render(scale=render_scale)
-            image = bitmap.to_pil()
-            image_buffer = io.BytesIO()
-            image.save(image_buffer, format='JPEG', quality=90, optimize=True)
-            image_buffer.seek(0)
+                    cmd = [
+                        tesseract_cmd,
+                        str(image_path),
+                        str(output_base),
+                        '--dpi',
+                        str(dpi),
+                        '-l',
+                        language,
+                    ]
+                    if psm_value:
+                        cmd.extend(['--psm', psm_value])
+                    cmd.append('pdf')
 
-            output.setPageSize((page_width, page_height))
-            output.drawImage(
-                ImageReader(image_buffer),
-                0,
-                0,
-                width=page_width,
-                height=page_height,
-                preserveAspectRatio=False,
-                mask='auto',
-            )
-            draw_invisible_text_layer(output, page_text, page_width, page_height)
-            output.showPage()
-            page.close()
+                    result = subprocess.run(
+                        cmd,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        check=False,
+                    )
+                    if result.returncode != 0:
+                        detail = (result.stderr or result.stdout or '').strip()
+                        raise RuntimeError(f'Tesseract failed on PDF page {label}: {detail}')
+
+                    page_pdf_path = Path(str(output_base) + '.pdf')
+                    if not page_pdf_path.exists():
+                        raise RuntimeError(f'Tesseract did not create a PDF for page {label}.')
+                    page_reader = PdfReader(str(page_pdf_path))
+                    if not page_reader.pages:
+                        raise RuntimeError(f'Tesseract created an empty PDF for page {label}.')
+                    writer.add_page(page_reader.pages[0])
+                finally:
+                    page.close()
     finally:
         source_pdf.close()
 
-    output.save()
+    with open(output_pdf_path, 'wb') as output_file:
+        writer.write(output_file)
     return output_pdf_path
 
 
@@ -2782,26 +2747,10 @@ def create_searchable_pdf_endpoint():
         if page_labels_json:
             page_labels = json.loads(page_labels_json)
 
-        page_texts = None
-        page_texts_json = request.form.get('page_texts_json', '').strip()
-        if page_texts_json:
-            parsed_texts = json.loads(page_texts_json)
-            if isinstance(parsed_texts, list):
-                page_texts = [str(value or '') for value in parsed_texts]
-
-        if page_texts is None:
-            result_text = request.form.get('result_text', '')
-            page_count_text = request.form.get('page_count', '').strip()
-            page_count = int(page_count_text) if page_count_text.isdigit() else None
-            page_texts = extract_searchable_pdf_page_texts(result_text, page_labels=page_labels, page_count=page_count)
-
-        if not page_texts:
-            return jsonify({'status': 'error', 'message': 'No OCR text available for searchable export'}), 400
-
         with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as output_file:
             temp_output_path = output_file.name
 
-        create_searchable_pdf(temp_input_path, page_texts, temp_output_path, page_labels=page_labels)
+        create_searchable_pdf(temp_input_path, temp_output_path, page_labels=page_labels)
         with open(temp_output_path, 'rb') as f:
             payload = f.read()
 

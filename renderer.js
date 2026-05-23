@@ -116,9 +116,7 @@ let currentImagePath = null;
 let currentResultText = null;
 let currentRawTokens = null;
 let currentPromptType = null;
-let currentOcrPageTexts = null;
 let currentOcrPageLabels = null;
-let currentOcrPageCount = null;
 let currentOcrIsPdf = false;
 let isProcessing = false;
 let lastBoxCount = 0;
@@ -659,9 +657,7 @@ async function loadImage(filePath) {
     downloadSearchablePdfBtn.style.display = 'none';
     viewBoxesBtn.style.display = 'none';
     viewTokensBtn.style.display = 'none';
-    currentOcrPageTexts = null;
     currentOcrPageLabels = null;
-    currentOcrPageCount = null;
     currentOcrIsPdf = false;
 
     // Clear overlay boxes
@@ -679,9 +675,7 @@ function clearImage() {
     currentResultText = null;
     currentRawTokens = null;
     currentPromptType = null;
-    currentOcrPageTexts = null;
     currentOcrPageLabels = null;
-    currentOcrPageCount = null;
     currentOcrIsPdf = false;
     imagePreview.src = '';
     imagePreview.style.display = 'block';
@@ -1279,9 +1273,7 @@ async function performOCR() {
             // Store raw tokens
             currentRawTokens = result.data.raw_tokens;
             currentOcrIsPdf = Boolean(result.data.is_pdf);
-            currentOcrPageTexts = Array.isArray(result.data.page_texts) ? result.data.page_texts : null;
             currentOcrPageLabels = Array.isArray(result.data.page_labels) ? result.data.page_labels : null;
-            currentOcrPageCount = Number(result.data.page_count || 0) || null;
 
             // Do a final render of all boxes with the complete token stream
             // This ensures any boxes that arrived after polling stopped are rendered
@@ -1471,10 +1463,7 @@ async function downloadSearchablePdf() {
 
         const result = await api.saveSearchablePdf({
             sourcePdfPath: currentImagePath,
-            resultText: currentResultText,
-            pageTexts: currentOcrPageTexts,
-            pageLabels: currentOcrPageLabels,
-            pageCount: currentOcrPageCount
+            pageLabels: currentOcrPageLabels
         });
 
         if (result.success) {
